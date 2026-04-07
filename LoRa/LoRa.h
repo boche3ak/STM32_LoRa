@@ -1,10 +1,10 @@
-// -------------------------------------------------- \\
-// |                                                | \\
-// |            WRITTEN BY: Sslman Motlaq           | \\
-// |               Telegram: @S_Motlaq              | \\
-// |         E-MAIL:  pilot.motlaq@gmail.com        | \\
-// |                                                | \\
-// -------------------------------------------------- //
+/* --------------------------------------------------
+* |                                                |
+* |            WRITTEN BY: Sslman Motlaq           |
+* |               Telegram: @S_Motlaq              |
+* |         E-MAIL:  pilot.motlaq@gmail.com        |
+* |                                                |
+* -------------------------------------------------- */
 
 #include "main.h"
 
@@ -86,7 +86,7 @@
 
 typedef struct LoRa_setting{
 	
-	// Hardware setings:
+	// Hardware settings:
 	GPIO_TypeDef*		CS_port;
 	uint16_t		CS_pin;
 	GPIO_TypeDef*		reset_port;
