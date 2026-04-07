@@ -29,6 +29,55 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/**
+ * Abstraction challenger - Transponder definitions
+ */
+enum {
+	Challenger = 0,
+	Transponder = 1
+};
+
+/**
+ * Abstraction Challenge requested/not requested definitions
+ */
+enum {
+	ChallengeNotRequested = 0,
+	ChallengeRequested    = 1
+};
+
+/**
+ * Abstraction function response OK/NOK
+ */
+enum {
+	OK  = 0,
+	NOK = 1
+};
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+#define TXRX_BUFFER_MAX_LENGTH 128
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+LoRa loRa;
+uint8_t TxBuffer[TXRX_BUFFER_MAX_LENGTH];
+uint8_t RxBuffer[TXRX_BUFFER_MAX_LENGTH];
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+
 // Send output to SWO
 int _write(int fd, char *ptr, int len) {
 	for (int i = 0; i < len; i++) {
@@ -36,30 +85,42 @@ int _write(int fd, char *ptr, int len) {
 	}
 	return len;
 }
-/* USER CODE END PTD */
 
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
+/**
+ * @brief wrapper to readout GPIO switch for the device assignment
+ *
+ * @retval Enum Challenger or Transponder
+ *
+ * @note according to the schematics we use PA5 pin for the switch
+ *       active   - Challenger
+ *       inactive - Transponder
+ *
+ * @note IMPORTANT - check that your pin initialization enables pin pull-up!
+ *
+ */
+uint8_t WhoAmI() {
+	return ((HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) == GPIO_PIN_SET)?Challenger:Transponder);
+}
 
-/* USER CODE END PD */
+/**
+ * @brief wrapper to readout GPIO for pushing challenge
+ *
+ * @retval enum Challenge Requested or not
+ *
+ * @note according to the schematics we use PA pin for the switch
+ *       active   - challenge requested
+ *       inactive - no challenge requested
+ *
+ * @note IMPORTANT - check that your pin initialisation enables pin pull-down!
+ *
+ */
+uint8_t isChallengeRequested(){
+	return ((HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) == GPIO_PIN_SET)?ChallengeRequested:ChallengeNotRequested);
+}
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
-
-/* USER CODE BEGIN PV */
-LoRa loRa;
-uint8_t TxBuffer[128];
-uint8_t RxBuffer[128];
-/* USER CODE END PV */
-
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-/* USER CODE BEGIN PFP */
-
+uint8_t EncodeChallengePackage(uint8_t* buffer, uint16_t length){
+	return OK;
+}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -75,7 +136,9 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  uint8_t oldChallengeRequested = ChallengeNotRequested; // additional variable to detect the signal edge
+  uint8_t TxBufferLength = TXRX_BUFFER_MAX_LENGTH;
+  uint16_t txTimeout = 500; //ms
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -99,6 +162,8 @@ int main(void)
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
 
+
+  /* initialize and start LoRa */
   loRa = newLoRa();
   loRa.CS_port         = NSS_GPIO_Port;
   loRa.CS_pin          = NSS_Pin;
@@ -110,17 +175,33 @@ int main(void)
 
   int returnCode = LoRa_init(&loRa);
 
-  if (returnCode == 200) {
-	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_SET);
-  } else {
-	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, 0);
-  }
+  //visual indication LoRa initialization.
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, (returnCode == 200)?GPIO_PIN_SET:GPIO_PIN_RESET);
 
   LoRa_startReceiving(&loRa);
 
-  TxBuffer[0] = 'O';
-  TxBuffer[1] = 'K';
+  /*am I challenger / checker or transponder / responder?*/
+  if(Challenger == WhoAmI()){
+    if(isChallengeRequested() && ChallengeRequested != oldChallengeRequested){
+    	oldChallengeRequested = ChallengeRequested;
+    	//ok, this is the edge of the request signal,
+    	//initialise the Challenge transaction
+    	EncodeChallengePackage(TxBuffer,TxBufferLength);
+    	LoRa_transmit(&loRa, TxBuffer, TxBufferLength, txTimeout);
+    }
+  }
 
+  /**
+   * The working sequence:
+   * 1. checking whoAmI
+   *   - challenger : watch for the input control GPIO, if requested transmit challenge, wait for the response
+   *   - transponder: start reception and wait for the valid challenge
+   * 2. duty cycle
+   *   - challenger : if GPIO is active, encode the challenge and transmit; wait for the response
+   *   - transponder: if challenge is received, try to decode, if valid, encode the response and transmit
+   *
+   *   Note: currently switch challenger/transponder is supported in runtime - this simplified arming in the field.
+   */
   LoRa_transmit(&loRa, TxBuffer, 2, 500);
 
   /* USER CODE END 2 */
@@ -192,6 +273,7 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
+	  //in release version we are aiming device reset
   }
   /* USER CODE END Error_Handler_Debug */
 }
