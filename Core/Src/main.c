@@ -20,6 +20,7 @@
 #include "main.h"
 #include "spi.h"
 #include "gpio.h"
+#include "cmox_crypto.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -38,24 +39,24 @@
  * Abstraction challenger - Transponder definitions
  */
 enum {
-	Challenger = 0,
-	Transponder = 1
+  Challenger = 0,
+  Transponder = 1
 };
 
 /**
  * Abstraction Challenge requested/not requested definitions
  */
 enum {
-	ChallengeNotRequested = 0,
-	ChallengeRequested    = 1
+  ChallengeNotRequested = 0,
+  ChallengeRequested    = 1
 };
 
 /**
  * Abstraction function response OK/NOK
  */
 enum {
-	OK  = 0,
-	NOK = 1
+  OK  = 0,
+  NOK = 1
 };
 
 /* USER CODE END PD */
@@ -72,6 +73,51 @@ enum {
 LoRa loRa;
 uint8_t TxBuffer[TXRX_BUFFER_MAX_LENGTH];
 uint8_t RxBuffer[TXRX_BUFFER_MAX_LENGTH];
+
+uint8_t oldChallengeRequested = ChallengeNotRequested; // additional variable to detect the signal edge
+uint8_t TxBufferLength = TXRX_BUFFER_MAX_LENGTH;
+uint16_t txTimeout = 500u; //ms
+
+static uint8_t stayActive = 1u; //main flag to keep the system running. Usage may be to e.g. stop everything in case of tamper detection of some other misuse
+
+static uint32_t mainCycleDelayNs = 2000u; //current mini-scheduler to run in 2ms cycles.
+
+/* ECC context */
+cmox_ecc_handle_t Ecc_Ctx;
+/* ECC working buffer */
+uint8_t Working_Buffer[2000];
+
+/**
+ * @brief This private key shall be located in the NVRAM so the setup device can rewrite it
+ */
+const uint8_t Private_Key[] =
+{
+  0x7d, 0x7d, 0xc5, 0xf7, 0x1e, 0xb2, 0x9d, 0xda, 0xf8, 0x0d, 0x62, 0x14, 0x63, 0x2e, 0xea, 0xe0,
+  0x3d, 0x90, 0x58, 0xaf, 0x1f, 0xb6, 0xd2, 0x2e, 0xd8, 0x0b, 0xad, 0xb6, 0x2b, 0xc1, 0xa5, 0x34
+};
+/**
+ * @brief This public key of the counterpart shall be located in the NVRAM so the setup device can rewrite it
+ */
+const uint8_t Remote_Public_Key[] =
+{
+  0x70, 0x0c, 0x48, 0xf7, 0x7f, 0x56, 0x58, 0x4c, 0x5c, 0xc6, 0x32, 0xca, 0x65, 0x64, 0x0d, 0xb9,
+  0x1b, 0x6b, 0xac, 0xce, 0x3a, 0x4d, 0xf6, 0xb4, 0x2c, 0xe7, 0xcc, 0x83, 0x88, 0x33, 0xd2, 0x87,
+  0xdb, 0x71, 0xe5, 0x09, 0xe3, 0xfd, 0x9b, 0x06, 0x0d, 0xdb, 0x20, 0xba, 0x5c, 0x51, 0xdc, 0xc5,
+  0x94, 0x8d, 0x46, 0xfb, 0xf6, 0x40, 0xdf, 0xe0, 0x44, 0x17, 0x82, 0xca, 0xb8, 0x5f, 0xa4, 0xac
+};
+
+/* Computed data buffer */
+uint8_t Computed_Secret[CMOX_ECC_SECP256R1_SECRET_LEN];
+
+/* ============================================================================
+ * TIMING & CLOCK CALIBRATION
+ * ============================================================================
+ */
+
+// Measure actual HCLK at runtime
+static uint32_t hclk_freq = 0u;
+static uint32_t hclk_freq_div_mio; //pre-calculated us factor
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -80,10 +126,37 @@ void SystemClock_Config(void);
 
 // Send output to SWO
 int _write(int fd, char *ptr, int len) {
-	for (int i = 0; i < len; i++) {
-		ITM_SendChar(ptr[i]); /* core_cm4.h */
-	}
-	return len;
+  for (int i = 0; i < len; i++) {
+    ITM_SendChar(ptr[i]); /* core_cm4.h */
+  }
+  return len;
+}
+
+static void init_timing(void) {
+    hclk_freq = HAL_RCC_GetHCLKFreq();
+    hclk_freq_div_mio = hclk_freq / 1000000UL;
+    // Typical: 72,000,000 Hz for STM32F103 at full speed
+    //but we currently use 8MHz to spare energy. Likely to change it for RSA though...
+}
+
+/**
+  * @brief  This function provides delay (in nanoseconds) based on CPU cycles method.
+  * @param  us: specifies the delay time in nanoseconds.
+  * @retval None
+  */
+
+void delay_us_precise(uint32_t us) {
+    // Enable DWT CYCCNT (cycle counter)
+    if (!(CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk)) {
+        CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    }
+    if (!(DWT->CTRL & CoreDebug_DEMCR_TRCENA_Msk)) {
+        DWT->CTRL |= CoreDebug_DEMCR_TRCENA_Msk;
+    }
+
+    DWT->CYCCNT = 0;
+    uint32_t target = hclk_freq_div_mio * us;
+    while (DWT->CYCCNT < target);
 }
 
 /**
@@ -98,8 +171,8 @@ int _write(int fd, char *ptr, int len) {
  * @note IMPORTANT - check that your pin initialization enables pin pull-up!
  *
  */
-uint8_t WhoAmI() {
-	return ((HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) == GPIO_PIN_SET)?Challenger:Transponder);
+static uint8_t WhoAmI() {
+  return ((HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) == GPIO_PIN_SET)?Challenger:Transponder);
 }
 
 /**
@@ -114,12 +187,16 @@ uint8_t WhoAmI() {
  * @note IMPORTANT - check that your pin initialisation enables pin pull-down!
  *
  */
-uint8_t isChallengeRequested(){
-	return ((HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) == GPIO_PIN_SET)?ChallengeRequested:ChallengeNotRequested);
+static uint8_t isChallengeRequested(){
+
+  if((HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) == GPIO_PIN_SET)?ChallengeRequested:ChallengeNotRequested){
+
+  }
+  return 0;
 }
 
 uint8_t EncodeChallengePackage(uint8_t* buffer, uint16_t length){
-	return OK;
+  return OK;
 }
 /* USER CODE END PFP */
 
@@ -136,9 +213,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  uint8_t oldChallengeRequested = ChallengeNotRequested; // additional variable to detect the signal edge
-  uint8_t TxBufferLength = TXRX_BUFFER_MAX_LENGTH;
-  uint16_t txTimeout = 500; //ms
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -152,8 +227,17 @@ int main(void)
 
   /* Configure the system clock */
   SystemClock_Config();
-
   /* USER CODE BEGIN SysInit */
+  init_timing(); //now we're set up to use systicks etc.
+
+  //crypto init
+  cmox_init_arg_t init_target = {CMOX_INIT_TARGET_AUTO, NULL};
+
+  /* Initialize cryptographic library */
+  if (cmox_initialize(&init_target) != CMOX_INIT_SUCCESS)
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END SysInit */
 
@@ -180,16 +264,20 @@ int main(void)
 
   LoRa_startReceiving(&loRa);
 
-  /*am I challenger / checker or transponder / responder?*/
-  if(Challenger == WhoAmI()){
+  /** main loop **/
+  while(stayActive){
+    /*am I challenger / checker or transponder / responder?*/
+    if(Challenger == WhoAmI()){
     if(isChallengeRequested() && ChallengeRequested != oldChallengeRequested){
-    	oldChallengeRequested = ChallengeRequested;
-    	//ok, this is the edge of the request signal,
-    	//initialise the Challenge transaction
-    	EncodeChallengePackage(TxBuffer,TxBufferLength);
-    	LoRa_transmit(&loRa, TxBuffer, TxBufferLength, txTimeout);
+      oldChallengeRequested = ChallengeRequested;
+      //ok, this is the edge of the request signal,
+      //initialise the Challenge transaction
+      EncodeChallengePackage(TxBuffer,TxBufferLength);
+      LoRa_transmit(&loRa, TxBuffer, TxBufferLength, txTimeout);
     }
-  }
+    }//if Challenger
+    delay_us_precise(mainCycleDelayNs);
+  }//while stay active ** main loop **
 
   /**
    * The working sequence:
@@ -211,7 +299,7 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-	/* USER CODE BEGIN 3 */
+  /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
@@ -255,9 +343,9 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-	if (GPIO_Pin == DIO0_Pin) {
-		LoRa_receive(&loRa, RxBuffer, 128);
-	}
+  if (GPIO_Pin == DIO0_Pin) {
+    LoRa_receive(&loRa, RxBuffer, 128);
+  }
 }
 
 /* USER CODE END 4 */
@@ -273,7 +361,7 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
-	  //in release version we are aiming device reset
+    //in release version we are aiming device reset
   }
   /* USER CODE END Error_Handler_Debug */
 }
