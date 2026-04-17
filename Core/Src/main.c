@@ -189,10 +189,7 @@ static uint8_t WhoAmI() {
  */
 static uint8_t isChallengeRequested(){
 
-  if((HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) == GPIO_PIN_SET)?ChallengeRequested:ChallengeNotRequested){
-
-  }
-  return 0;
+  return 1;//ToDo: challenge is always requested, LoRa will regulate power to limit the range.
 }
 
 uint8_t EncodeChallengePackage(uint8_t* buffer, uint16_t length){
@@ -245,7 +242,7 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
-
+  uint8_t devType = WhoAmI();//this check once on init - the switch is hided in the case
 
   /* initialize and start LoRa */
   loRa = newLoRa();
@@ -266,17 +263,18 @@ int main(void)
 
   /** main loop **/
   while(stayActive){
-    /*am I challenger / checker or transponder / responder?*/
-    if(Challenger == WhoAmI()){
-    if(isChallengeRequested() && ChallengeRequested != oldChallengeRequested){
-      oldChallengeRequested = ChallengeRequested;
-      //ok, this is the edge of the request signal,
-      //initialise the Challenge transaction
-      EncodeChallengePackage(TxBuffer,TxBufferLength);
-      LoRa_transmit(&loRa, TxBuffer, TxBufferLength, txTimeout);
-    }
-    }//if Challenger
-    delay_us_precise(mainCycleDelayNs);
+	  switch(devType){
+	  case Challenger:
+	      EncodeChallengePackage(TxBuffer,TxBufferLength);
+	      LoRa_transmit(&loRa, TxBuffer, TxBufferLength, txTimeout);
+	  break;
+	  case Transponder:
+	  break;
+	  default:
+		  //this branch shall be never reached - error case
+	  }
+
+	  delay_us_precise(mainCycleDelayNs);
   }//while stay active ** main loop **
 
   /**
