@@ -205,6 +205,22 @@ static uint8_t isChallengeRequested(){
   return 1;//ToDo: challenge is always requested, LoRa will regulate power to limit the range.
 }
 
+/**
+ * @brief  Encode a challenge packet into the transmit buffer.
+ *
+ * Packet layout: | Magic(4) | Counter(4) | HMAC-SHA256[0:15](16) |
+ *
+ * The 32-bit counter is incremented on every call and serialised big-endian.
+ * The HMAC is computed over (Magic || Counter) using the first 32 bytes of
+ * the ECDH shared secret (x-coordinate of the shared point) as the key.
+ * The tag is truncated to 16 bytes to minimise air-time.
+ *
+ * @param  buffer  Pointer to the transmit buffer.  Must be at least
+ *                 CHALLENGE_PACKET_LEN bytes long.
+ * @param  length  Usable length of @p buffer in bytes.
+ * @retval OK      Packet encoded successfully.
+ * @retval NOK     Buffer too short or HMAC computation failed.
+ */
 static uint8_t EncodeChallengePackage(uint8_t* buffer, uint16_t length){
   if(length < CHALLENGE_PACKET_LEN) return NOK;
 
@@ -234,8 +250,22 @@ static uint8_t EncodeChallengePackage(uint8_t* buffer, uint16_t length){
   return (ret == CMOX_MAC_SUCCESS) ? OK : NOK;
 }
 
-/* Verify a received challenge on the Transponder side.
- * Returns OK and writes the embedded counter into *outCounter on success. */
+/**
+ * @brief  Verify a received challenge packet on the Transponder side.
+ *
+ * Checks the magic pattern prefix, then recomputes the HMAC over
+ * (Magic || Counter) and compares it against the tag carried in the packet.
+ * On success the embedded challenge counter is written to @p outCounter so
+ * the Transponder can echo it back in the response.
+ *
+ * @param  buffer      Pointer to the received data buffer.
+ * @param  length      Number of valid bytes in @p buffer.  Must be at least
+ *                     CHALLENGE_PACKET_LEN.
+ * @param  outCounter  Output: challenge counter extracted from the packet.
+ *                     Written only when the function returns OK.
+ * @retval OK          Magic and HMAC verified successfully.
+ * @retval NOK         Buffer too short, magic mismatch, or HMAC failure.
+ */
 static uint8_t DecodeChallengePackage(uint8_t* buffer, uint16_t length, uint32_t* outCounter){
   if(length < CHALLENGE_PACKET_LEN) return NOK;
 
@@ -261,8 +291,27 @@ static uint8_t DecodeChallengePackage(uint8_t* buffer, uint16_t length, uint32_t
   return OK;
 }
 
-/* Build the Transponder response: echo the challenge counter, embed the local
- * receive timestamp so the Challenger can measure round-trip time. */
+/**
+ * @brief  Encode the Transponder response packet into the transmit buffer.
+ *
+ * Packet layout: | Magic(4) | EchoCounter(4) | RxTimestamp(4) | HMAC-SHA256[0:15](16) |
+ *
+ * The challenge counter received from the Challenger is echoed back verbatim
+ * so the Challenger can match the response to its outstanding request.
+ * The Transponder's local receive timestamp (HAL_GetTick(), ms) is included
+ * so the Challenger has visibility into the one-way propagation component of
+ * the round-trip time.
+ * The HMAC is computed over (Magic || EchoCounter || RxTimestamp) using the
+ * first 32 bytes of the ECDH shared secret as the key.
+ *
+ * @param  buffer       Pointer to the transmit buffer.  Must be at least
+ *                      RESPONSE_PACKET_LEN bytes long.
+ * @param  length       Usable length of @p buffer in bytes.
+ * @param  echoCounter  Challenge counter value copied from the received packet.
+ * @param  rxTimestamp  Local timestamp (ms) recorded when the challenge arrived.
+ * @retval OK           Packet encoded successfully.
+ * @retval NOK          Buffer too short or HMAC computation failed.
+ */
 static uint8_t EncodeResponsePackage(uint8_t* buffer, uint16_t length,
                                      uint32_t echoCounter, uint32_t rxTimestamp){
   if(length < RESPONSE_PACKET_LEN) return NOK;
@@ -292,8 +341,28 @@ static uint8_t EncodeResponsePackage(uint8_t* buffer, uint16_t length,
   return (ret == CMOX_MAC_SUCCESS) ? OK : NOK;
 }
 
-/* Verify the Transponder response on the Challenger side.
- * Writes echo_counter and transponder rx_timestamp on success. */
+/**
+ * @brief  Verify a Transponder response packet on the Challenger side.
+ *
+ * Checks the magic pattern prefix, then recomputes the HMAC over
+ * (Magic || EchoCounter || RxTimestamp) and compares it against the tag in
+ * the packet.  On success the echo counter and the Transponder's receive
+ * timestamp are written to the output parameters.
+ *
+ * The Challenger must additionally verify that the echo counter matches the
+ * counter it sent and that the measured round-trip time is within the
+ * configured tolerance (RESPONSE_DELAY_TOLERANCE_MS).
+ *
+ * @param  buffer           Pointer to the received data buffer.
+ * @param  length           Number of valid bytes in @p buffer.  Must be at
+ *                          least RESPONSE_PACKET_LEN.
+ * @param  outEchoCounter   Output: challenge counter echoed by the Transponder.
+ *                          Written only when the function returns OK.
+ * @param  outRxTimestamp   Output: Transponder local receive timestamp (ms).
+ *                          Written only when the function returns OK.
+ * @retval OK               Magic and HMAC verified successfully.
+ * @retval NOK              Buffer too short, magic mismatch, or HMAC failure.
+ */
 static uint8_t DecodeResponsePackage(uint8_t* buffer, uint16_t length,
                                      uint32_t* outEchoCounter, uint32_t* outRxTimestamp){
   if(length < RESPONSE_PACKET_LEN) return NOK;
@@ -470,28 +539,13 @@ int main(void)
   }
 
 
-  /**
-   * The working sequence:
-   * 1. checking whoAmI
-   *   - challenger : watch for the input control GPIO, if requested transmit challenge, wait for the response
-   *   - transponder: start reception and wait for the valid challenge
-   * 2. duty cycle
-   *   - challenger : if GPIO is active, encode the challenge and transmit; wait for the response
-   *   - transponder: if challenge is received, try to decode, if valid, encode the response and transmit
-   *
-   *   Note: currently switch challenger/transponder is supported in runtime - this simplified arming in the field.
-   */
-  LoRa_transmit(&loRa, TxBuffer, 2, 500);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
     /* USER CODE END WHILE */
   /* USER CODE BEGIN 3 */
-  }
   /* USER CODE END 3 */
 }
 

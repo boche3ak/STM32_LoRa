@@ -45,7 +45,8 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 20K
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 64K
+  FLASH    (rx)   : ORIGIN = 0x08000000,   LENGTH = 63K   /* 63K for code; last 1K page reserved for NVRAM */
+  NVRAM    (r)    : ORIGIN = 0x0800FC00,   LENGTH = 1K    /* one erase page: magic pattern + keys */
 }
 
 /* Sections */
@@ -185,4 +186,35 @@ SECTIONS
   }
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
+
+  /* -------------------------------------------------------------------------
+   * FoF NVRAM region  (0x0800FC00 – 0x0800FFFF, one 1 KB erase page)
+   *
+   * All three sections share one page so a single flash-page erase during
+   * field provisioning rewrites magic, private key and remote public key
+   * atomically.  The setup tool must erase the whole page and reprogram all
+   * three items even when only one of them changes.
+   *
+   * Section layout inside the page:
+   *   offset 0x000  .fof_magic            4 B   (0x0800FC00)
+   *   offset 0x004  .fof_private_key      32 B  (0x0800FC04)
+   *   offset 0x024  .fof_remote_public_key 64 B (0x0800FC24)
+   * ------------------------------------------------------------------------- */
+  .fof_magic :
+  {
+    KEEP(*(.fof_magic))
+    . = ALIGN(4);
+  } >NVRAM
+
+  .fof_private_key :
+  {
+    KEEP(*(.fof_private_key))
+    . = ALIGN(4);
+  } >NVRAM
+
+  .fof_remote_public_key :
+  {
+    KEEP(*(.fof_remote_public_key))
+    . = ALIGN(4);
+  } >NVRAM
 }
