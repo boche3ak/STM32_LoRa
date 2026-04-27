@@ -25,6 +25,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
+#include "string.h"
 #include "LoRa.h"
 /* USER CODE END Includes */
 
@@ -64,7 +65,11 @@ enum {
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 
-#define TXRX_BUFFER_MAX_LENGTH 128
+#define TXRX_BUFFER_MAX_LENGTH        128
+#define MAGIC_PATTERN_LEN              4u
+#define CHALLENGE_PACKET_LEN          (MAGIC_PATTERN_LEN + 4u + 16u)        /* magic(4) | counter(4) | HMAC(16) */
+#define RESPONSE_PACKET_LEN           (MAGIC_PATTERN_LEN + 4u + 4u + 16u)   /* magic(4) | echo_counter(4) | rx_ts(4) | HMAC(16) */
+#define RESPONSE_DELAY_TOLERANCE_MS    500u  /* max acceptable round-trip time; tune per deployment */
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -79,6 +84,7 @@ uint8_t TxBufferLength = TXRX_BUFFER_MAX_LENGTH;
 uint16_t txTimeout = 500u; //ms
 
 static uint8_t stayActive = 1u; //main flag to keep the system running. Usage may be to e.g. stop everything in case of tamper detection of some other misuse
+static volatile uint8_t loRaRxReady = 0u;
 
 static uint32_t mainCycleDelayNs = 2000u; //current mini-scheduler to run in 2ms cycles.
 
@@ -90,6 +96,7 @@ uint8_t Working_Buffer[2000];
 /**
  * @brief This private key shall be located in the NVRAM so the setup device can rewrite it
  */
+__attribute__((section(".fof_private_key")))
 const uint8_t Private_Key[] =
 {
   0x7d, 0x7d, 0xc5, 0xf7, 0x1e, 0xb2, 0x9d, 0xda, 0xf8, 0x0d, 0x62, 0x14, 0x63, 0x2e, 0xea, 0xe0,
@@ -98,6 +105,7 @@ const uint8_t Private_Key[] =
 /**
  * @brief This public key of the counterpart shall be located in the NVRAM so the setup device can rewrite it
  */
+__attribute__((section(".fof_remote_public_key")))
 const uint8_t Remote_Public_Key[] =
 {
   0x70, 0x0c, 0x48, 0xf7, 0x7f, 0x56, 0x58, 0x4c, 0x5c, 0xc6, 0x32, 0xca, 0x65, 0x64, 0x0d, 0xb9,
@@ -108,6 +116,11 @@ const uint8_t Remote_Public_Key[] =
 
 /* Computed data buffer */
 uint8_t Computed_Secret[CMOX_ECC_SECP256R1_SECRET_LEN];
+
+/* Magic pattern — section attribute prepares this symbol for placement at a
+ * dedicated flash address via the linker script (.fof_magic region). */
+__attribute__((section(".fof_magic")))
+static const uint8_t Magic_Pattern[MAGIC_PATTERN_LEN] = { 0xF0, 0x0F, 0xDE, 0xAD };
 
 /* ============================================================================
  * TIMING & CLOCK CALIBRATION
@@ -192,7 +205,123 @@ static uint8_t isChallengeRequested(){
   return 1;//ToDo: challenge is always requested, LoRa will regulate power to limit the range.
 }
 
-uint8_t EncodeChallengePackage(uint8_t* buffer, uint16_t length){
+static uint8_t EncodeChallengePackage(uint8_t* buffer, uint16_t length){
+  if(length < CHALLENGE_PACKET_LEN) return NOK;
+
+  static uint32_t challengeCounter = 0u;
+  challengeCounter++;
+
+  /* [0 .. MAGIC_PATTERN_LEN-1] : magic pattern */
+  memcpy(buffer, Magic_Pattern, MAGIC_PATTERN_LEN);
+
+  /* [MAGIC_PATTERN_LEN .. +3] : 32-bit counter big-endian (replay-protection nonce) */
+  buffer[MAGIC_PATTERN_LEN + 0u] = (uint8_t)(challengeCounter >> 24);
+  buffer[MAGIC_PATTERN_LEN + 1u] = (uint8_t)(challengeCounter >> 16);
+  buffer[MAGIC_PATTERN_LEN + 2u] = (uint8_t)(challengeCounter >>  8);
+  buffer[MAGIC_PATTERN_LEN + 3u] = (uint8_t)(challengeCounter);
+
+  /* [MAGIC_PATTERN_LEN+4 .. +19] : HMAC-SHA256 over (magic || counter), key = ECDH secret x-coord.
+   * Tag truncated to 16 bytes to keep air-time short. */
+  size_t tagLen = 0u;
+  cmox_mac_retval_t ret = cmox_mac_compute(
+      CMOX_HMAC_SHA256_ALGO,
+      buffer, MAGIC_PATTERN_LEN + 4u,
+      Computed_Secret, 32u,
+      NULL, 0u,
+      &buffer[MAGIC_PATTERN_LEN + 4u], 16u,
+      &tagLen);
+
+  return (ret == CMOX_MAC_SUCCESS) ? OK : NOK;
+}
+
+/* Verify a received challenge on the Transponder side.
+ * Returns OK and writes the embedded counter into *outCounter on success. */
+static uint8_t DecodeChallengePackage(uint8_t* buffer, uint16_t length, uint32_t* outCounter){
+  if(length < CHALLENGE_PACKET_LEN) return NOK;
+
+  if(memcmp(buffer, Magic_Pattern, MAGIC_PATTERN_LEN) != 0) return NOK;
+
+  uint8_t expectedTag[16];
+  size_t  tagLen = 0u;
+  cmox_mac_retval_t ret = cmox_mac_compute(
+      CMOX_HMAC_SHA256_ALGO,
+      buffer, MAGIC_PATTERN_LEN + 4u,
+      Computed_Secret, 32u,
+      NULL, 0u,
+      expectedTag, 16u,
+      &tagLen);
+
+  if(ret != CMOX_MAC_SUCCESS) return NOK;
+  if(memcmp(&buffer[MAGIC_PATTERN_LEN + 4u], expectedTag, 16u) != 0) return NOK;
+
+  *outCounter = ((uint32_t)buffer[MAGIC_PATTERN_LEN + 0u] << 24) |
+                ((uint32_t)buffer[MAGIC_PATTERN_LEN + 1u] << 16) |
+                ((uint32_t)buffer[MAGIC_PATTERN_LEN + 2u] <<  8) |
+                ((uint32_t)buffer[MAGIC_PATTERN_LEN + 3u]);
+  return OK;
+}
+
+/* Build the Transponder response: echo the challenge counter, embed the local
+ * receive timestamp so the Challenger can measure round-trip time. */
+static uint8_t EncodeResponsePackage(uint8_t* buffer, uint16_t length,
+                                     uint32_t echoCounter, uint32_t rxTimestamp){
+  if(length < RESPONSE_PACKET_LEN) return NOK;
+
+  memcpy(buffer, Magic_Pattern, MAGIC_PATTERN_LEN);
+
+  buffer[MAGIC_PATTERN_LEN + 0u] = (uint8_t)(echoCounter >> 24);
+  buffer[MAGIC_PATTERN_LEN + 1u] = (uint8_t)(echoCounter >> 16);
+  buffer[MAGIC_PATTERN_LEN + 2u] = (uint8_t)(echoCounter >>  8);
+  buffer[MAGIC_PATTERN_LEN + 3u] = (uint8_t)(echoCounter);
+
+  buffer[MAGIC_PATTERN_LEN + 4u] = (uint8_t)(rxTimestamp >> 24);
+  buffer[MAGIC_PATTERN_LEN + 5u] = (uint8_t)(rxTimestamp >> 16);
+  buffer[MAGIC_PATTERN_LEN + 6u] = (uint8_t)(rxTimestamp >>  8);
+  buffer[MAGIC_PATTERN_LEN + 7u] = (uint8_t)(rxTimestamp);
+
+  /* HMAC over magic || echo_counter || rx_timestamp */
+  size_t tagLen = 0u;
+  cmox_mac_retval_t ret = cmox_mac_compute(
+      CMOX_HMAC_SHA256_ALGO,
+      buffer, MAGIC_PATTERN_LEN + 4u + 4u,
+      Computed_Secret, 32u,
+      NULL, 0u,
+      &buffer[MAGIC_PATTERN_LEN + 4u + 4u], 16u,
+      &tagLen);
+
+  return (ret == CMOX_MAC_SUCCESS) ? OK : NOK;
+}
+
+/* Verify the Transponder response on the Challenger side.
+ * Writes echo_counter and transponder rx_timestamp on success. */
+static uint8_t DecodeResponsePackage(uint8_t* buffer, uint16_t length,
+                                     uint32_t* outEchoCounter, uint32_t* outRxTimestamp){
+  if(length < RESPONSE_PACKET_LEN) return NOK;
+
+  if(memcmp(buffer, Magic_Pattern, MAGIC_PATTERN_LEN) != 0) return NOK;
+
+  uint8_t expectedTag[16];
+  size_t  tagLen = 0u;
+  cmox_mac_retval_t ret = cmox_mac_compute(
+      CMOX_HMAC_SHA256_ALGO,
+      buffer, MAGIC_PATTERN_LEN + 4u + 4u,
+      Computed_Secret, 32u,
+      NULL, 0u,
+      expectedTag, 16u,
+      &tagLen);
+
+  if(ret != CMOX_MAC_SUCCESS) return NOK;
+  if(memcmp(&buffer[MAGIC_PATTERN_LEN + 4u + 4u], expectedTag, 16u) != 0) return NOK;
+
+  *outEchoCounter  = ((uint32_t)buffer[MAGIC_PATTERN_LEN + 0u] << 24) |
+                     ((uint32_t)buffer[MAGIC_PATTERN_LEN + 1u] << 16) |
+                     ((uint32_t)buffer[MAGIC_PATTERN_LEN + 2u] <<  8) |
+                     ((uint32_t)buffer[MAGIC_PATTERN_LEN + 3u]);
+
+  *outRxTimestamp  = ((uint32_t)buffer[MAGIC_PATTERN_LEN + 4u] << 24) |
+                     ((uint32_t)buffer[MAGIC_PATTERN_LEN + 5u] << 16) |
+                     ((uint32_t)buffer[MAGIC_PATTERN_LEN + 6u] <<  8) |
+                     ((uint32_t)buffer[MAGIC_PATTERN_LEN + 7u]);
   return OK;
 }
 /* USER CODE END PFP */
@@ -262,20 +391,84 @@ int main(void)
   LoRa_startReceiving(&loRa);
 
   /** main loop **/
-  while(stayActive){
-	  switch(devType){
-	  case Challenger:
-	      EncodeChallengePackage(TxBuffer,TxBufferLength);
-	      LoRa_transmit(&loRa, TxBuffer, TxBufferLength, txTimeout);
-	  break;
-	  case Transponder:
-	  break;
-	  default:
-		  //this branch shall be never reached - error case
-	  }
+  switch(devType){
+    case Challenger: {
+      size_t secretLen = 0u;
+      cmox_ecc_construct(&Ecc_Ctx, CMOX_MATH_FUNCS_SMALL, Working_Buffer, sizeof(Working_Buffer));
+      cmox_ecdh(&Ecc_Ctx, CMOX_ECC_SECP256R1_LOWMEM,
+                Private_Key,       sizeof(Private_Key),
+                Remote_Public_Key, sizeof(Remote_Public_Key),
+                Computed_Secret,   &secretLen);
+      cmox_ecc_cleanup(&Ecc_Ctx);
 
-	  delay_us_precise(mainCycleDelayNs);
-  }//while stay active ** main loop **
+      while(stayActive){
+        if(EncodeChallengePackage(TxBuffer, TxBufferLength) == OK){
+          /* Read back the counter we just packed so we can validate the echo */
+          uint32_t sentCounter = ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 0u] << 24) |
+                                 ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 1u] << 16) |
+                                 ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 2u] <<  8) |
+                                 ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 3u]);
+
+          uint32_t txTimestamp = HAL_GetTick();
+          LoRa_transmit(&loRa, TxBuffer, CHALLENGE_PACKET_LEN, txTimeout);
+
+          loRaRxReady = 0u;
+          LoRa_startReceiving(&loRa);
+          uint32_t rxStart = HAL_GetTick();
+          while((HAL_GetTick() - rxStart) < 1000u && !loRaRxReady){
+            delay_us_precise(mainCycleDelayNs);
+          }
+
+          if(!loRaRxReady){
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_SET); /* timeout — no reply */
+          } else {
+            uint32_t roundTripMs   = HAL_GetTick() - txTimestamp;
+            uint32_t echoCounter   = 0u;
+            uint32_t transponderTs = 0u;
+
+            if(DecodeResponsePackage(RxBuffer, RESPONSE_PACKET_LEN,
+                                     &echoCounter, &transponderTs) == OK
+               && echoCounter == sentCounter
+               && roundTripMs <= RESPONSE_DELAY_TOLERANCE_MS){
+              HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_SET); /* friend confirmed */
+            }
+          }
+        }
+        delay_us_precise(mainCycleDelayNs);
+      }//while stay active ** Challenger main loop **
+    } break;
+
+    case Transponder: {
+      size_t secretLen = 0u;
+      cmox_ecc_construct(&Ecc_Ctx, CMOX_MATH_FUNCS_SMALL, Working_Buffer, sizeof(Working_Buffer));
+      cmox_ecdh(&Ecc_Ctx, CMOX_ECC_SECP256R1_LOWMEM,
+                Private_Key,       sizeof(Private_Key),
+                Remote_Public_Key, sizeof(Remote_Public_Key),
+                Computed_Secret,   &secretLen);
+      cmox_ecc_cleanup(&Ecc_Ctx);
+
+      LoRa_startReceiving(&loRa); /* silent listen; reception is IRQ-driven */
+
+      while(stayActive){
+        if(loRaRxReady){
+          uint32_t rxTimestamp = HAL_GetTick(); /* capture arrival time before any processing */
+          loRaRxReady = 0u;
+
+          uint32_t echoCounter = 0u;
+          if(DecodeChallengePackage(RxBuffer, CHALLENGE_PACKET_LEN, &echoCounter) == OK){
+            if(EncodeResponsePackage(TxBuffer, TxBufferLength, echoCounter, rxTimestamp) == OK){
+              LoRa_transmit(&loRa, TxBuffer, RESPONSE_PACKET_LEN, txTimeout);
+              LoRa_startReceiving(&loRa); /* return to silent listen after reply */
+            }
+          }
+        }
+        delay_us_precise(mainCycleDelayNs);
+      }//while stay active ** Transponder main loop **
+    } break;
+    default:
+      //this branch shall be never reached - error case
+  }
+
 
   /**
    * The working sequence:
@@ -343,6 +536,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == DIO0_Pin) {
     LoRa_receive(&loRa, RxBuffer, 128);
+    loRaRxReady = 1u;
   }
 }
 
