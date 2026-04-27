@@ -70,6 +70,27 @@ enum {
 #define CHALLENGE_PACKET_LEN          (MAGIC_PATTERN_LEN + 4u + 16u)        /* magic(4) | counter(4) | HMAC(16) */
 #define RESPONSE_PACKET_LEN           (MAGIC_PATTERN_LEN + 4u + 4u + 16u)   /* magic(4) | echo_counter(4) | rx_ts(4) | HMAC(16) */
 #define RESPONSE_DELAY_TOLERANCE_MS    500u  /* max acceptable round-trip time; tune per deployment */
+
+/* ---------------------------------------------------------------------------
+ * Watchdog configuration
+ *
+ * Comment out WATCHDOG_ENABLED to disable the IWDG (e.g. during debugging).
+ * WATCHDOG_TIMEOUT_MS sets the reset window.
+ *
+ * The IWDG is clocked by the LSI oscillator (~40 kHz on STM32F1).
+ * With prescaler /32 each tick is 0.8 ms; maximum timeout ≈ 3276 ms.
+ * Reload formula: WATCHDOG_TIMEOUT_MS × 40 / 32 − 1
+ * ---------------------------------------------------------------------------*/
+//#define WATCHDOG_ENABLED
+#define WATCHDOG_TIMEOUT_MS            1000u
+#define WATCHDOG_PRESCALER             IWDG_PRESCALER_32
+#define WATCHDOG_RELOAD               ((WATCHDOG_TIMEOUT_MS * 40u / 32u) - 1u)
+
+#ifdef WATCHDOG_ENABLED
+  #define WATCHDOG_REFRESH()           HAL_IWDG_Refresh(&hiwdg)
+#else
+  #define WATCHDOG_REFRESH()           ((void)0)
+#endif
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -85,6 +106,10 @@ uint16_t txTimeout = 500u; //ms
 
 static uint8_t stayActive = 1u; //main flag to keep the system running. Usage may be to e.g. stop everything in case of tamper detection of some other misuse
 static volatile uint8_t loRaRxReady = 0u;
+
+#ifdef WATCHDOG_ENABLED
+static IWDG_HandleTypeDef hiwdg;
+#endif
 
 static uint32_t mainCycleDelayNs = 2000u; //current mini-scheduler to run in 2ms cycles.
 
@@ -440,6 +465,16 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
+
+#ifdef WATCHDOG_ENABLED
+  hiwdg.Instance       = IWDG;
+  hiwdg.Init.Prescaler = WATCHDOG_PRESCALER;
+  hiwdg.Init.Reload    = WATCHDOG_RELOAD;
+  if(HAL_IWDG_Init(&hiwdg) != HAL_OK){
+    Error_Handler();
+  }
+#endif
+
   uint8_t devType = WhoAmI();//this check once on init - the switch is hided in the case
 
   /* initialize and start LoRa */
@@ -486,6 +521,7 @@ int main(void)
           uint32_t rxStart = HAL_GetTick();
           while((HAL_GetTick() - rxStart) < 1000u && !loRaRxReady){
             delay_us_precise(mainCycleDelayNs);
+            WATCHDOG_REFRESH();
           }
 
           if(!loRaRxReady){
@@ -504,6 +540,7 @@ int main(void)
           }
         }
         delay_us_precise(mainCycleDelayNs);
+        WATCHDOG_REFRESH();
       }//while stay active ** Challenger main loop **
     } break;
 
@@ -532,6 +569,7 @@ int main(void)
           }
         }
         delay_us_precise(mainCycleDelayNs);
+        WATCHDOG_REFRESH();
       }//while stay active ** Transponder main loop **
     } break;
     default:
