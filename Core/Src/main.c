@@ -214,23 +214,6 @@ static uint8_t WhoAmI() {
 }
 
 /**
- * @brief wrapper to readout GPIO for pushing challenge
- *
- * @retval enum Challenge Requested or not
- *
- * @note according to the schematics we use PA pin for the switch
- *       active   - challenge requested
- *       inactive - no challenge requested
- *
- * @note IMPORTANT - check that your pin initialisation enables pin pull-down!
- *
- */
-static uint8_t isChallengeRequested(){
-
-  return 1;//ToDo: challenge is always requested, LoRa will regulate power to limit the range.
-}
-
-/**
  * @brief  Encode a challenge packet into the transmit buffer.
  *
  * Packet layout: | Magic(4) | Counter(4) | HMAC-SHA256[0:15](16) |
