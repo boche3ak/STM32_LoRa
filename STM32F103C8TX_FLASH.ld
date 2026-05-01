@@ -195,13 +195,6 @@ SECTIONS
    * must erase the whole page and reprogram every section even when only one
    * value changes.
    *
-   * Section layout inside the page:
-   *   offset 0x000  .fof_magic             4 B   (0x0800FC00)
-   *   offset 0x004  .fof_private_key       32 B  (0x0800FC04)
-   *   offset 0x024  .fof_remote_public_key 64 B  (0x0800FC24)
-   *   offset 0x064  .fof_config             8 B  (0x0800FC64)
-   *                   Cfg_ResponseDelayToleranceMs  4 B
-   *                   Cfg_WatchdogTimeoutMs         4 B
    * ------------------------------------------------------------------------- */
   .fof_magic :
   {

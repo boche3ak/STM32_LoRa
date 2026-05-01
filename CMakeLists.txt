@@ -63,6 +63,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE STM32Cryptographic_CM3)
 add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND}
         -DOBJDUMP=${CMAKE_OBJDUMP}
+        -DNM=${CMAKE_NM}
         -DELF_FILE=$<TARGET_FILE:${CMAKE_PROJECT_NAME}>
         -P ${CMAKE_SOURCE_DIR}/cmake/print_fof_sections.cmake
     COMMENT "FoF NVRAM section layout"
