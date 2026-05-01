@@ -21,5 +21,11 @@ Gate: at least one peer review approval **and** buildable code
 
 Git merge: fast forward with rebase - *this will create a strait main branch with no dubious merge commits.*
 
+## Howto build:
 
+This is a cmake project. Use the following commands to generate and build:
+
+`cmake -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake -DCMAKE_BUILD_TYPE=Debug -B build`
+
+`cmake --build build`
 

@@ -45,7 +45,8 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 20K
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 64K
+  FLASH    (rx)   : ORIGIN = 0x08000000,   LENGTH = 63K   /* 63K for code; last 1K page reserved for NVRAM */
+  NVRAM    (r)    : ORIGIN = 0x0800FC00,   LENGTH = 1K    /* one erase page: magic pattern + keys */
 }
 
 /* Sections */
@@ -185,4 +186,37 @@ SECTIONS
   }
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
+
+  /* -------------------------------------------------------------------------
+   * FoF NVRAM region  (0x0800FC00 – 0x0800FFFF, one 1 KB erase page)
+   *
+   * All sections share one page so a single flash-page erase during field
+   * provisioning rewrites all provisioned data atomically.  The setup tool
+   * must erase the whole page and reprogram every section even when only one
+   * value changes.
+   *
+   * ------------------------------------------------------------------------- */
+  .fof_magic :
+  {
+    KEEP(*(.fof_magic))
+    . = ALIGN(4);
+  } >NVRAM
+
+  .fof_private_key :
+  {
+    KEEP(*(.fof_private_key))
+    . = ALIGN(4);
+  } >NVRAM
+
+  .fof_remote_public_key :
+  {
+    KEEP(*(.fof_remote_public_key))
+    . = ALIGN(4);
+  } >NVRAM
+
+  .fof_config :
+  {
+    KEEP(*(.fof_config))
+    . = ALIGN(4);
+  } >NVRAM
 }
