@@ -1,4 +1,3 @@
-/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
@@ -6,7 +5,7 @@
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2026 STMicroelectronics.
+  * Copyright (c) 2026 Oleksandr Kotenkov and Sergij Boshe.
   * All rights reserved.
   *
   * This software is licensed under terms that can be found in the LICENSE file
@@ -15,7 +14,6 @@
   *
   ******************************************************************************
   */
-/* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "spi.h"
@@ -23,19 +21,14 @@
 #include "cmox_crypto.h"
 
 /* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
 #include "stdio.h"
 #include "string.h"
 #include "LoRa.h"
-/* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
 
-/* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
 /**
  * Abstraction challenger - Transponder definitions
  */
@@ -60,63 +53,77 @@ enum {
   NOK = 1
 };
 
-/* USER CODE END PD */
-
 /* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
 
-#define TXRX_BUFFER_MAX_LENGTH        128
+/* pin definitions according to the current schematics*/
+#define PIN_READ_WHOAMI                  HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8)           /* PA8 */
+#define PIN_WRITE_STAT_FRIEND_FOF(state) HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, (state)) /* PA2 */
+#define PIN_WRITE_STAT_POWERON(state)    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, (state)) /* PA3 */
+#define STAT_FRIEND                     GPIO_PIN_SET
+#define STAT_FOE                        GPIO_PIN_RESET
+
+
+/* predefined parameters*/
+#define TXRX_BUFFER_MAX_LENGTH        128u
 #define MAGIC_PATTERN_LEN              4u
-#define CHALLENGE_PACKET_LEN          (MAGIC_PATTERN_LEN + 4u + 16u)        /* magic(4) | counter(4) | HMAC(16) */
-#define RESPONSE_PACKET_LEN           (MAGIC_PATTERN_LEN + 4u + 4u + 16u)   /* magic(4) | echo_counter(4) | rx_ts(4) | HMAC(16) */
-#define RESPONSE_DELAY_TOLERANCE_MS    500u  /* max acceptable round-trip time; tune per deployment */
+#define CHALLENGE_PACKET_LEN          (MAGIC_PATTERN_LEN + 4u + 16u)      /* magic(4) | counter(4) | HMAC(16) */
+#define RESPONSE_PACKET_LEN           (MAGIC_PATTERN_LEN + 4u + 4u + 16u) /* magic(4) | echo_counter(4) | rx_ts(4) | HMAC(16) */
+#define TX_TIMEOUT_MS                  500u
+#define MAIN_CYCLE_DELAY_US            2000u
+#define ECC_WORKING_BUFFER_SIZE        2000u
 
 /* ---------------------------------------------------------------------------
  * Watchdog configuration
  *
  * Comment out WATCHDOG_ENABLED to disable the IWDG (e.g. during debugging).
- * WATCHDOG_TIMEOUT_MS sets the reset window.
+ * Timeout and delay tolerance are runtime-configurable via the .fof_config
+ * flash section (Cfg_WatchdogTimeoutMs, Cfg_ResponseDelayToleranceMs).
  *
  * The IWDG is clocked by the LSI oscillator (~40 kHz on STM32F1).
  * With prescaler /32 each tick is 0.8 ms; maximum timeout ≈ 3276 ms.
- * Reload formula: WATCHDOG_TIMEOUT_MS × 40 / 32 − 1
+ * Reload formula: Cfg_WatchdogTimeoutMs × 40 / 32 − 1
  * ---------------------------------------------------------------------------*/
 //#define WATCHDOG_ENABLED
-#define WATCHDOG_TIMEOUT_MS            1000u
 #define WATCHDOG_PRESCALER             IWDG_PRESCALER_32
-#define WATCHDOG_RELOAD               ((WATCHDOG_TIMEOUT_MS * 40u / 32u) - 1u)
+#define WATCHDOG_RELOAD               ((Cfg_WatchdogTimeoutMs * 40u / 32u) - 1u)
 
 #ifdef WATCHDOG_ENABLED
   #define WATCHDOG_REFRESH()           HAL_IWDG_Refresh(&hiwdg)
 #else
   #define WATCHDOG_REFRESH()           ((void)0)
 #endif
-/* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-
-/* USER CODE BEGIN PV */
 LoRa loRa;
 uint8_t TxBuffer[TXRX_BUFFER_MAX_LENGTH];
 uint8_t RxBuffer[TXRX_BUFFER_MAX_LENGTH];
 
-uint8_t oldChallengeRequested = ChallengeNotRequested; // additional variable to detect the signal edge
-uint8_t TxBufferLength = TXRX_BUFFER_MAX_LENGTH;
-uint16_t txTimeout = 500u; //ms
-
-static uint8_t stayActive = 1u; //main flag to keep the system running. Usage may be to e.g. stop everything in case of tamper detection of some other misuse
+uint8_t oldChallengeRequested = ChallengeNotRequested;
+static uint8_t stayActive = 1u;
 static volatile uint8_t loRaRxReady = 0u;
 
 #ifdef WATCHDOG_ENABLED
 static IWDG_HandleTypeDef hiwdg;
 #endif
 
-static uint32_t mainCycleDelayNs = 2000u; //current mini-scheduler to run in 2ms cycles.
-
-/* ECC context */
+/* ECC context and working buffer */
 cmox_ecc_handle_t Ecc_Ctx;
-/* ECC working buffer */
-uint8_t Working_Buffer[2000];
+uint8_t Working_Buffer[ECC_WORKING_BUFFER_SIZE];
+
+/**
+ * @brief Maximum acceptable challenge–response round-trip time in milliseconds.
+ *        Located in .fof_config so a provisioning tool can update it without
+ *        reflashing the application.
+ */
+__attribute__((section(".fof_config")))
+const uint32_t Cfg_ResponseDelayToleranceMs = 500u;
+
+/**
+ * @brief IWDG timeout in milliseconds.  Used to compute the reload register
+ *        value at startup.  Located in .fof_config for field configurability.
+ */
+__attribute__((section(".fof_config")))
+const uint32_t Cfg_WatchdogTimeoutMs = 1000u;
 
 /**
  * @brief This private key shall be located in the NVRAM so the setup device can rewrite it
@@ -156,11 +163,8 @@ static const uint8_t Magic_Pattern[MAGIC_PATTERN_LEN] = { 0xF0, 0x0F, 0xDE, 0xAD
 static uint32_t hclk_freq = 0u;
 static uint32_t hclk_freq_div_mio; //pre-calculated us factor
 
-/* USER CODE END PV */
-
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-/* USER CODE BEGIN PFP */
 
 // Send output to SWO
 int _write(int fd, char *ptr, int len) {
@@ -198,6 +202,34 @@ void delay_us_precise(uint32_t us) {
 }
 
 /**
+ * @brief Fault indicator: flashes STAT_POWERON LED and blocks forever.
+ *
+ * @details Intended for catastrophic startup failures where further execution
+ *          must be prevented. Produces a repeating pattern of 3 fast flashes
+ *          (100 ms on / 100 ms off) followed by a 1 s pause, then repeats.
+ *          The watchdog is refreshed at the end of every flash and every 500 ms
+ *          during the pause so the reset timer never fires and the pattern
+ *          continues indefinitely.
+ *
+ * @note    This function never returns.
+ */
+static void FaultBlinkHalt(void) {
+  while(1) {
+    for(uint8_t i = 0u; i < 3u; i++) {
+      PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+      HAL_Delay(100u);
+      PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+      HAL_Delay(100u);
+      WATCHDOG_REFRESH();
+    }
+    HAL_Delay(500u);
+    WATCHDOG_REFRESH();
+    HAL_Delay(500u);
+    WATCHDOG_REFRESH();
+  }
+}
+
+/**
  * @brief wrapper to readout GPIO switch for the device assignment
  *
  * @retval Enum Challenger or Transponder
@@ -210,7 +242,7 @@ void delay_us_precise(uint32_t us) {
  *
  */
 static uint8_t WhoAmI() {
-  return ((HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5) == GPIO_PIN_SET)?Challenger:Transponder);
+  return ((PIN_READ_WHOAMI == GPIO_PIN_SET)?Challenger:Transponder);
 }
 
 /**
@@ -359,7 +391,7 @@ static uint8_t EncodeResponsePackage(uint8_t* buffer, uint16_t length,
  *
  * The Challenger must additionally verify that the echo counter matches the
  * counter it sent and that the measured round-trip time is within the
- * configured tolerance (RESPONSE_DELAY_TOLERANCE_MS).
+ * configured tolerance (Cfg_ResponseDelayToleranceMs).
  *
  * @param  buffer           Pointer to the received data buffer.
  * @param  length           Number of valid bytes in @p buffer.  Must be at
@@ -401,12 +433,6 @@ static uint8_t DecodeResponsePackage(uint8_t* buffer, uint16_t length,
                      ((uint32_t)buffer[MAGIC_PATTERN_LEN + 7u]);
   return OK;
 }
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
-
-/* USER CODE END 0 */
 
 /**
   * @brief  The application entry point.
@@ -415,22 +441,14 @@ static uint8_t DecodeResponsePackage(uint8_t* buffer, uint16_t length,
 int main(void)
 {
 
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
   /* Configure the system clock */
   SystemClock_Config();
-  /* USER CODE BEGIN SysInit */
+  /* SysInit */
   init_timing(); //now we're set up to use systicks etc.
 
   //crypto init
@@ -442,12 +460,9 @@ int main(void)
     Error_Handler();
   }
 
-  /* USER CODE END SysInit */
-
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_SPI1_Init();
-  /* USER CODE BEGIN 2 */
 
 #ifdef WATCHDOG_ENABLED
   hiwdg.Instance       = IWDG;
@@ -472,9 +487,11 @@ int main(void)
 
   int returnCode = LoRa_init(&loRa);
 
-  //visual indication LoRa initialization.
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, (returnCode == 200)?GPIO_PIN_SET:GPIO_PIN_RESET);
+  if(returnCode != 200) {
+    FaultBlinkHalt();
+  }
 
+  PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
   LoRa_startReceiving(&loRa);
 
   /** main loop **/
@@ -489,7 +506,7 @@ int main(void)
       cmox_ecc_cleanup(&Ecc_Ctx);
 
       while(stayActive){
-        if(EncodeChallengePackage(TxBuffer, TxBufferLength) == OK){
+        if(EncodeChallengePackage(TxBuffer, TXRX_BUFFER_MAX_LENGTH) == OK){
           /* Read back the counter we just packed so we can validate the echo */
           uint32_t sentCounter = ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 0u] << 24) |
                                  ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 1u] << 16) |
@@ -497,18 +514,18 @@ int main(void)
                                  ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 3u]);
 
           uint32_t txTimestamp = HAL_GetTick();
-          LoRa_transmit(&loRa, TxBuffer, CHALLENGE_PACKET_LEN, txTimeout);
+          LoRa_transmit(&loRa, TxBuffer, CHALLENGE_PACKET_LEN, TX_TIMEOUT_MS);
 
           loRaRxReady = 0u;
           LoRa_startReceiving(&loRa);
           uint32_t rxStart = HAL_GetTick();
           while((HAL_GetTick() - rxStart) < 1000u && !loRaRxReady){
-            delay_us_precise(mainCycleDelayNs);
+            delay_us_precise(MAIN_CYCLE_DELAY_US);
             WATCHDOG_REFRESH();
           }
 
           if(!loRaRxReady){
-            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_SET); /* timeout — no reply */
+            PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* timeout — no reply or foe */
           } else {
             uint32_t roundTripMs   = HAL_GetTick() - txTimestamp;
             uint32_t echoCounter   = 0u;
@@ -517,12 +534,14 @@ int main(void)
             if(DecodeResponsePackage(RxBuffer, RESPONSE_PACKET_LEN,
                                      &echoCounter, &transponderTs) == OK
                && echoCounter == sentCounter
-               && roundTripMs <= RESPONSE_DELAY_TOLERANCE_MS){
-              HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_SET); /* friend confirmed */
+               && roundTripMs <= Cfg_ResponseDelayToleranceMs){
+              PIN_WRITE_STAT_FRIEND_FOF(STAT_FRIEND);
+            } else {
+              PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* bad HMAC, counter mismatch, or delay exceeded */
             }
           }
         }
-        delay_us_precise(mainCycleDelayNs);
+        delay_us_precise(MAIN_CYCLE_DELAY_US);
         WATCHDOG_REFRESH();
       }//while stay active ** Challenger main loop **
     } break;
@@ -545,29 +564,20 @@ int main(void)
 
           uint32_t echoCounter = 0u;
           if(DecodeChallengePackage(RxBuffer, CHALLENGE_PACKET_LEN, &echoCounter) == OK){
-            if(EncodeResponsePackage(TxBuffer, TxBufferLength, echoCounter, rxTimestamp) == OK){
-              LoRa_transmit(&loRa, TxBuffer, RESPONSE_PACKET_LEN, txTimeout);
+            if(EncodeResponsePackage(TxBuffer, TXRX_BUFFER_MAX_LENGTH, echoCounter, rxTimestamp) == OK){
+              LoRa_transmit(&loRa, TxBuffer, RESPONSE_PACKET_LEN, TX_TIMEOUT_MS);
               LoRa_startReceiving(&loRa); /* return to silent listen after reply */
             }
           }
         }
-        delay_us_precise(mainCycleDelayNs);
+        delay_us_precise(MAIN_CYCLE_DELAY_US);
         WATCHDOG_REFRESH();
       }//while stay active ** Transponder main loop **
     } break;
     default:
       //this branch shall be never reached - error case
+      Error_Handler();
   }
-
-
-
-  /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-    /* USER CODE END WHILE */
-  /* USER CODE BEGIN 3 */
-  /* USER CODE END 3 */
 }
 
 /**
@@ -606,7 +616,6 @@ void SystemClock_Config(void)
   }
 }
 
-/* USER CODE BEGIN 4 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == DIO0_Pin) {
@@ -615,7 +624,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   }
 }
 
-/* USER CODE END 4 */
 
 /**
   * @brief  This function is executed in case of error occurrence.
@@ -623,14 +631,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
     //in release version we are aiming device reset
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
 /**
@@ -642,9 +648,7 @@ void Error_Handler(void)
   */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line number,
      ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
