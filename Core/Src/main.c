@@ -68,8 +68,7 @@ enum {
 #define MAGIC_PATTERN_LEN              4u
 #define CHALLENGE_PACKET_LEN          (MAGIC_PATTERN_LEN + 4u + 16u)      /* magic(4) | counter(4) | HMAC(16) */
 #define RESPONSE_PACKET_LEN           (MAGIC_PATTERN_LEN + 4u + 4u + 16u) /* magic(4) | echo_counter(4) | rx_ts(4) | HMAC(16) */
-#define TX_TIMEOUT_MS                  500u
-#define MAIN_CYCLE_DELAY_US            2000u
+
 #define ECC_WORKING_BUFFER_SIZE        2000u
 
 /* ---------------------------------------------------------------------------
@@ -109,6 +108,20 @@ static IWDG_HandleTypeDef hiwdg;
 /* ECC context and working buffer */
 cmox_ecc_handle_t Ecc_Ctx;
 uint8_t Working_Buffer[ECC_WORKING_BUFFER_SIZE];
+
+/**
+ * @brief LoRa transmit timeout in milliseconds.
+ *        Located in .fof_config for field configurability.
+ */
+__attribute__((section(".fof_config")))
+const uint32_t Cfg_TxTimeoutMs = 500u;
+
+/**
+ * @brief Main loop cycle period in microseconds.
+ *        Located in .fof_config for field configurability.
+ */
+__attribute__((section(".fof_config")))
+const uint32_t Cfg_MainCycleDelayUs = 2000u;
 
 /**
  * @brief Maximum acceptable challenge–response round-trip time in milliseconds.
@@ -514,13 +527,13 @@ int main(void)
                                  ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 3u]);
 
           uint32_t txTimestamp = HAL_GetTick();
-          LoRa_transmit(&loRa, TxBuffer, CHALLENGE_PACKET_LEN, TX_TIMEOUT_MS);
+          LoRa_transmit(&loRa, TxBuffer, CHALLENGE_PACKET_LEN, Cfg_TxTimeoutMs);
 
           loRaRxReady = 0u;
           LoRa_startReceiving(&loRa);
           uint32_t rxStart = HAL_GetTick();
           while((HAL_GetTick() - rxStart) < 1000u && !loRaRxReady){
-            delay_us_precise(MAIN_CYCLE_DELAY_US);
+            delay_us_precise(Cfg_MainCycleDelayUs);
             WATCHDOG_REFRESH();
           }
 
@@ -541,7 +554,7 @@ int main(void)
             }
           }
         }
-        delay_us_precise(MAIN_CYCLE_DELAY_US);
+        delay_us_precise(Cfg_MainCycleDelayUs);
         WATCHDOG_REFRESH();
       }//while stay active ** Challenger main loop **
     } break;
@@ -565,12 +578,12 @@ int main(void)
           uint32_t echoCounter = 0u;
           if(DecodeChallengePackage(RxBuffer, CHALLENGE_PACKET_LEN, &echoCounter) == OK){
             if(EncodeResponsePackage(TxBuffer, TXRX_BUFFER_MAX_LENGTH, echoCounter, rxTimestamp) == OK){
-              LoRa_transmit(&loRa, TxBuffer, RESPONSE_PACKET_LEN, TX_TIMEOUT_MS);
+              LoRa_transmit(&loRa, TxBuffer, RESPONSE_PACKET_LEN, Cfg_TxTimeoutMs);
               LoRa_startReceiving(&loRa); /* return to silent listen after reply */
             }
           }
         }
-        delay_us_precise(MAIN_CYCLE_DELAY_US);
+        delay_us_precise(Cfg_MainCycleDelayUs);
         WATCHDOG_REFRESH();
       }//while stay active ** Transponder main loop **
     } break;
