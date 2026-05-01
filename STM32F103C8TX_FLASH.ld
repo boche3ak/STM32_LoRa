@@ -190,15 +190,18 @@ SECTIONS
   /* -------------------------------------------------------------------------
    * FoF NVRAM region  (0x0800FC00 – 0x0800FFFF, one 1 KB erase page)
    *
-   * All three sections share one page so a single flash-page erase during
-   * field provisioning rewrites magic, private key and remote public key
-   * atomically.  The setup tool must erase the whole page and reprogram all
-   * three items even when only one of them changes.
+   * All sections share one page so a single flash-page erase during field
+   * provisioning rewrites all provisioned data atomically.  The setup tool
+   * must erase the whole page and reprogram every section even when only one
+   * value changes.
    *
    * Section layout inside the page:
-   *   offset 0x000  .fof_magic            4 B   (0x0800FC00)
-   *   offset 0x004  .fof_private_key      32 B  (0x0800FC04)
-   *   offset 0x024  .fof_remote_public_key 64 B (0x0800FC24)
+   *   offset 0x000  .fof_magic             4 B   (0x0800FC00)
+   *   offset 0x004  .fof_private_key       32 B  (0x0800FC04)
+   *   offset 0x024  .fof_remote_public_key 64 B  (0x0800FC24)
+   *   offset 0x064  .fof_config             8 B  (0x0800FC64)
+   *                   Cfg_ResponseDelayToleranceMs  4 B
+   *                   Cfg_WatchdogTimeoutMs         4 B
    * ------------------------------------------------------------------------- */
   .fof_magic :
   {
@@ -215,6 +218,12 @@ SECTIONS
   .fof_remote_public_key :
   {
     KEEP(*(.fof_remote_public_key))
+    . = ALIGN(4);
+  } >NVRAM
+
+  .fof_config :
+  {
+    KEEP(*(.fof_config))
     . = ALIGN(4);
   } >NVRAM
 }
