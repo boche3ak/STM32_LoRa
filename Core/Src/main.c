@@ -58,7 +58,11 @@ enum {
 /* pin definitions according to the current schematics*/
 #define PIN_READ_WHOAMI                  HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8)           /* PA8 */
 #define PIN_WRITE_STAT_FRIEND_FOF(state) HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, (state)) /* PA2 */
-#define PIN_WRITE_STAT_POWERON(state)    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, (state)) /* PA3 */
+#ifdef WATCHDOG_ENABLED
+  #define PIN_WRITE_STAT_POWERON(state)    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, (state)) /* PA3 */
+#else
+  #define PIN_WRITE_STAT_POWERON(state)    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, (state)) /* PC13 - using available LED for debug purposes */
+#endif
 #define STAT_FRIEND                     GPIO_PIN_SET
 #define STAT_FOE                        GPIO_PIN_RESET
 
@@ -230,9 +234,9 @@ static void FaultBlinkHalt(void) {
   while(1) {
     for(uint8_t i = 0u; i < 3u; i++) {
       PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
-      HAL_Delay(100u);
+      HAL_Delay(500u);
       PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
-      HAL_Delay(100u);
+      HAL_Delay(300u);
       WATCHDOG_REFRESH();
     }
     HAL_Delay(500u);
@@ -504,7 +508,7 @@ int main(void)
     FaultBlinkHalt();
   }
 
-  PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+  PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
   LoRa_startReceiving(&loRa);
 
   /** main loop **/
