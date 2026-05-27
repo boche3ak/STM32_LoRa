@@ -29,8 +29,18 @@ target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Enable watchdog in Release builds only.
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
-    $<$<CONFIG:Release>:WATCHDOG_ENABLED>
+$<$<CONFIG:Release>:WATCHDOG_ENABLED>
 )
+message("===================================================")
+if($<CONFIG:Release>)
+    message("This is a release version with following setup:")
+    message("WATCHDOG: ENABLED")
+    else()
+    message("This is a debug version with following limitations:")
+    message("WATCHDOG: DISABLED")
+    message("POWER LED is PC13 (standard blue pill)")
+    endif()
+message("===================================================")
 
 # ---------------------------------------------------------------------------
 # CubeMX-managed HAL drivers and generated application sources.
