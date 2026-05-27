@@ -19,6 +19,7 @@
 #include "spi.h"
 #include "gpio.h"
 #include "cmox_crypto.h"
+#include "uart_prov.h"
 
 /* Private includes ----------------------------------------------------------*/
 #include "stdio.h"
@@ -480,6 +481,12 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_SPI1_Init();
+
+  /* Field provisioning via UART (PA9/PA10, 9600 8N1).
+   * Runs only when a provisioning counterpart is present on startup.
+   * Keys and config are written to NVRAM; the call is a no-op if no
+   * counterpart is detected within the detection window. */
+  uart_prov_run();
 
 #ifdef WATCHDOG_ENABLED
   hiwdg.Instance       = IWDG;
