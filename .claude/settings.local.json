@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake -DCMAKE_BUILD_TYPE=Debug -B build)",
+      "Bash(rm -rf build)",
+      "Bash(cmake -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake -DCMAKE_BUILD_TYPE=Debug -B build)",
+      "Bash(cmake --build build)",
+      "Bash(cmake --preset debug)",
+      "Bash(cmake --preset release)"
+    ]
+  }
+}

@@ -13,7 +13,6 @@ project(STM32_Lora C ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)   # required for GNU extensions used by HAL/CMSIS
-
 # Create the main executable target.
 # Sources are added by cmake/stm32cubemx/CMakeLists.txt via add_subdirectory.
 add_executable(${CMAKE_PROJECT_NAME})
@@ -32,7 +31,7 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 $<$<CONFIG:Release>:WATCHDOG_ENABLED>
 )
 message("===================================================")
-if($<CONFIG:Release>)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
     message("This is a release version with following setup:")
     message("WATCHDOG: ENABLED")
     else()

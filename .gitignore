@@ -2,3 +2,5 @@ Debug
 *.o
 build/
 .settings/language.settings.xml
+ozone.jdebug
+ozone.jdebug.user
