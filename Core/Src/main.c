@@ -460,7 +460,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_SPI1_Init();
+  MX_SPI1_Init(); //SPI1 is used for LoRa module
 
   /* Field provisioning via UART (PA9/PA10, 9600 8N1).
    * Runs only when a provisioning counterpart is present on startup.
@@ -476,8 +476,8 @@ int main(void)
     Error_Handler();
   }
 #endif
-
-  uint8_t devType = WhoAmI();//this check once on init - the switch is hided in the case
+  //this check once on init - the switch is hided in the case
+  uint8_t devType = WhoAmI();//1 - Challenger, 0 - Transponder
 
   /* initialize and start LoRa */
   loRa = newLoRa();
@@ -496,7 +496,6 @@ int main(void)
   }
 
   PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
-  LoRa_startReceiving(&loRa);
 
   /** main loop **/
   switch(devType){
