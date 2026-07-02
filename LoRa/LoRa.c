@@ -550,6 +550,57 @@ int LoRa_getRSSI(LoRa* _LoRa){
 }
 
 /* ----------------------------------------------------------------------------- *\
+    name        : LoRa_getModemStat
+
+    description : reads out the modem status register considering op mode config
+
+    arguments   :
+      LoRa* LoRa        --> LoRa object handler
+
+    returns     : Nothing
+\* ----------------------------------------------------------------------------- */
+uint8_t LoRa_getModemStat(LoRa* _LoRa){
+	uint8_t read;
+	//prior to reading the modem status we shall check if the module is in LoRa mode, otherwise the read value will be 0x00
+	read = LoRa_read(_LoRa, RegOpMode);
+	if((read & 0x80) == 0x00)
+		return 0x00;//we're in FSK/OOK mode, immediate exit
+	read = LoRa_read(_LoRa, RegModemStat);
+	return read;
+}
+/* ----------------------------------------------------------------------------- *\
+    name        : LoRa_getModemStatusEval
+
+    description : evaluates the modem status and returns the appropriate value
+
+    arguments   :
+      LoRa* LoRa        --> LoRa object handler
+
+    returns     : 1 if Rx is running, 2 if Tx is running, 3 if CAD is running, 0 if Idle
+\* ----------------------------------------------------------------------------- */
+uint8_t LoRa_getModemStatusEval(LoRa* _LoRa){
+	uint8_t read;
+	read = LoRa_getModemStat(_LoRa) & 0x07;//we only care about the 3 LSBs that represent the current modem status
+	return read;
+}
+/* ----------------------------------------------------------------------------- *\
+    name        : LoRa_getIrqFlags
+
+    description : non-destructive read of RegIrqFlags. Unlike the internal reads
+                  in LoRa_transmit/LoRa_receive, this does NOT clear any flags,
+                  so it is safe to call at any time purely for diagnostics.
+
+    arguments   :
+      LoRa* LoRa        --> LoRa object handler
+
+    returns     : raw RegIrqFlags value
+                  bit7 RxTimeout | bit6 RxDone | bit5 PayloadCrcError | bit4 ValidHeader
+                  bit3 TxDone    | bit2 CadDone | bit1 FhssChangeChannel | bit0 CadDetected
+\* ----------------------------------------------------------------------------- */
+uint8_t LoRa_getIrqFlags(LoRa* _LoRa){
+	return LoRa_read(_LoRa, RegIrqFlags);
+}
+/* ----------------------------------------------------------------------------- *\
     name        : LoRa_init
 
     description : initialize and set the right setting according to LoRa sruct vars

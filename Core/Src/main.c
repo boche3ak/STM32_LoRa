@@ -107,6 +107,24 @@ uint8_t oldChallengeRequested = ChallengeNotRequested;
 static uint8_t stayActive = 1u;
 static volatile uint8_t loRaRxReady = 0u;
 
+/* Debug: individual RegModemStat bits, refreshed once per main loop cycle.
+ * Watch these directly in the debugger instead of decoding LoRa_getModemStatusEval()'s
+ * packed return value by hand. */
+static volatile uint8_t Dbg_ModemRxOngoing      = 0u;
+static volatile uint8_t Dbg_ModemSignalSync     = 0u;
+static volatile uint8_t Dbg_ModemSignalDetected = 0u;
+
+/* Debug: individual RegIrqFlags bits, refreshed once per main loop cycle.
+ * Read non-destructively via LoRa_getIrqFlags() - does not clear any flags. */
+static volatile uint8_t Dbg_IrqRxTimeout         = 0u;
+static volatile uint8_t Dbg_IrqRxDone            = 0u;
+static volatile uint8_t Dbg_IrqPayloadCrcError   = 0u;
+static volatile uint8_t Dbg_IrqValidHeader       = 0u;
+static volatile uint8_t Dbg_IrqTxDone            = 0u;
+static volatile uint8_t Dbg_IrqCadDone           = 0u;
+static volatile uint8_t Dbg_IrqFhssChangeChannel = 0u;
+static volatile uint8_t Dbg_IrqCadDetected       = 0u;
+
 #ifdef WATCHDOG_ENABLED
 static IWDG_HandleTypeDef hiwdg;
 #endif
@@ -241,6 +259,46 @@ static void FaultBlinkHalt(void) {
  */
 static uint8_t WhoAmI() {
   return ((PIN_READ_WHOAMI == GPIO_PIN_SET)?Challenger:Transponder);
+}
+
+/**
+ * @brief Refresh the Dbg_Modem* globals from the radio's current modem status.
+ *
+ * @details Splits the packed LoRa_getModemStatusEval() return value into its
+ *          three individual bits (RxOngoing, SignalSynchronized, SignalDetected)
+ *          so each can be watched separately in the debugger without manual
+ *          bit-masking. Intended to be called once per main loop cycle.
+ *
+ * @retval None
+ */
+static void UpdateModemStatusDebug(void) {
+  uint8_t status = LoRa_getModemStatusEval(&loRa);
+  Dbg_ModemRxOngoing      = (status >> 2) & 0x01u;
+  Dbg_ModemSignalSync     = (status >> 1) & 0x01u;
+  Dbg_ModemSignalDetected = (status >> 0) & 0x01u;
+}
+
+/**
+ * @brief Refresh the Dbg_Irq* globals from the radio's current RegIrqFlags.
+ *
+ * @details Splits the raw, non-destructively read RegIrqFlags value into its
+ *          8 individual bits so each can be watched separately in the
+ *          debugger. Uses LoRa_getIrqFlags(), which does not clear any flags,
+ *          so calling this has no effect on protocol logic. Intended to be
+ *          called once per main loop cycle.
+ *
+ * @retval None
+ */
+static void UpdateIrqFlagsDebug(void) {
+  uint8_t flags = LoRa_getIrqFlags(&loRa);
+  Dbg_IrqRxTimeout         = (flags >> 7) & 0x01u;
+  Dbg_IrqRxDone            = (flags >> 6) & 0x01u;
+  Dbg_IrqPayloadCrcError   = (flags >> 5) & 0x01u;
+  Dbg_IrqValidHeader       = (flags >> 4) & 0x01u;
+  Dbg_IrqTxDone            = (flags >> 3) & 0x01u;
+  Dbg_IrqCadDone           = (flags >> 2) & 0x01u;
+  Dbg_IrqFhssChangeChannel = (flags >> 1) & 0x01u;
+  Dbg_IrqCadDetected       = (flags >> 0) & 0x01u;
 }
 
 /**
@@ -544,6 +602,8 @@ int main(void)
             }
           }
         }
+        UpdateModemStatusDebug();
+        UpdateIrqFlagsDebug();
         delay_us_precise(Cfg_MainCycleDelayUs);
         WATCHDOG_REFRESH();
       }//while stay active ** Challenger main loop **
@@ -573,6 +633,8 @@ int main(void)
             }
           }
         }
+        UpdateModemStatusDebug();
+        UpdateIrqFlagsDebug();
         delay_us_precise(Cfg_MainCycleDelayUs);
         WATCHDOG_REFRESH();
       }//while stay active ** Transponder main loop **
