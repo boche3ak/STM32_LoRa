@@ -341,10 +341,31 @@ class ProvSession:
 
     # ── Phase 2 — read config (GET_CONFIG) ───────────────────────────────────
 
+    def _recv_packet_from_sof(self) -> Optional[Tuple[int, bytes]]:
+        """Read TYPE+LEN+PAYLOAD+CRC after SOF has already been consumed."""
+        frame = bytearray([PROV_SOF])
+        for _ in range(2):           # TYPE, LEN
+            b = self._recv(self.byte_timeout)
+            if b is None:
+                return None
+            frame.append(b)
+        pkt_len = frame[2]
+        for _ in range(pkt_len):     # PAYLOAD
+            b = self._recv(self.byte_timeout)
+            if b is None:
+                return None
+            frame.append(b)
+        for _ in range(2):           # CRC HI, LO
+            b = self._recv(self.byte_timeout)
+            if b is None:
+                return None
+            frame.append(b)
+        return parse_packet(bytes(frame))
+
     def get_config(self) -> Optional[Dict[str, int]]:
         """
         Send a GET_CONFIG request and return the device config dict.
-        Returns None if the device sends PROV_RJCT or does not support the command.
+        Returns None on error or if the device does not support the command.
         """
         packet = build_packet(PKT_GET_CONFIG, b"")
         print(f"\n  {bold('▸  GET_CONFIG request')}")
@@ -360,12 +381,21 @@ class ProvSession:
             return None
 
         if resp in (PROV_RJCT, PROV_NAK):
-            print()
-            print(f"  {red('✗')}  This device doesn't support reading out the configuration.")
+            print(f"\n  {red('✗')}  This device doesn't support reading out the configuration.")
             return None
 
-        # Future: device sends ACK then a config packet back.
-        # For now any other byte is unexpected.
+        if resp == PROV_SOF:
+            result = self._recv_packet_from_sof()
+            if result is None:
+                self._log(red("Timeout reading response packet"))
+                return None
+            pkt_type, payload = result
+            if pkt_type != PKT_CONFIG or len(payload) != CONFIG_LEN:
+                self._log(red(f"Unexpected response: type=0x{pkt_type:02X} len={len(payload)}"))
+                return None
+            self._log(green("Configuration received  ✓"))
+            return _unpack_config(payload)
+
         self._log(yellow(f"Unexpected response 0x{resp:02X}"))
         return None
 

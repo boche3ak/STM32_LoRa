@@ -333,8 +333,18 @@ UartProvResult uart_prov_run(void)
 
         if (pkt_ok) {
             if (pkt.type == PROV_GET_CONFIG) {
-                /* Read-back not yet implemented on this device. */
-                uart_send(PROV_RJCT);
+                /* Send current NVRAM config back as a CONFIG packet. */
+                uint8_t resp[3u + PROV_CONFIG_LEN];
+                resp[0u] = PROV_SOF;
+                resp[1u] = PROV_TYPE_CONFIG;
+                resp[2u] = PROV_CONFIG_LEN;
+                memcpy(&resp[3u],
+                       (const void *)(NVRAM_BASE_ADDR + NVRAM_CONFIG_OFF),
+                       PROV_CONFIG_LEN);
+                uint16_t resp_crc = crc16_ccitt(resp, (uint16_t)(3u + PROV_CONFIG_LEN));
+                for (uint8_t i = 0u; i < (uint8_t)sizeof(resp); i++) uart_send(resp[i]);
+                uart_send((uint8_t)(resp_crc >> 8u));
+                uart_send((uint8_t)(resp_crc & 0xFFu));
             } else {
                 uart_send(PROV_ACK);   /* ACK = accepted + ready for next */
                 switch (pkt.type) {

@@ -39,8 +39,8 @@
   *                                         [3] ResponseWaitCycleDelayMs
   *                                         [4] ResponseDelayToleranceMs
   *                                         [5] WatchdogTimeoutMs
-  *   PROV_GET_CONFIG    0xB4   0 bytes  — query: read back current config
-  *                                         device replies PROV_RJCT (0xFF) if unsupported
+  *   PROV_GET_CONFIG    0xB4   0 bytes  — query: read back current NVRAM config
+  *                                         device replies with a PROV_TYPE_CONFIG packet
   *
   * Control byte (device → counterpart, response to unsupported request):
   *   PROV_RJCT   0xFF  — request not supported by this device firmware
