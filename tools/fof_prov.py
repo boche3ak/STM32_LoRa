@@ -215,7 +215,7 @@ class Settings:
         "port":         "/dev/serial0",
         "baud":         9600,
         "max_retries":  3,
-        "wait_timeout": 8.0,
+        "wait_timeout": 30.0,
         "byte_timeout": 5.0,
         "key_dir":      "keys",
         "verbose":      False,
@@ -955,7 +955,8 @@ def make_parser() -> argparse.ArgumentParser:
 
     g = ap.add_argument_group("behaviour")
     g.add_argument("--max-retries",  type=int, default=None, metavar="N")
-    g.add_argument("--wait",         type=float, default=None, metavar="SECS")
+    g.add_argument("--wait",         type=float, default=None, metavar="SECS",
+                   help="seconds to wait for device READY  (default: 30)")
     g.add_argument("--byte-timeout", type=float, default=None, metavar="SECS")
     g.add_argument("--dry-run",      action="store_true",
                    help="build and print packets without opening the serial port")
