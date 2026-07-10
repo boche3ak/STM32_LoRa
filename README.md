@@ -45,18 +45,27 @@ over USART1 at startup. No reflash of the application binary is needed.
 | GND    | GND       | shared reference |
 
 Settings: **9600 baud, 8N1, no flow control.**
+PA10 is held idle-high by an internal pull-up while disconnected, preventing noise
+on the floating pin from triggering a false session.
 
 PA8 is not part of the UART link — it is the WHOAMI selector pin (Challenger vs Transponder).
 
 ### When provisioning runs
 
-On every power-on the device sends a READY signal up to three times with a 2-second
-timeout each (6 seconds total). If a counterpart responds, provisioning begins. If not,
-the device proceeds normally with whatever keys are already stored in flash.
+On every power-on the device sends a READY byte up to three times with a 2-second
+timeout each (6 seconds total). If a counterpart responds with a valid protocol byte
+(`PING`, `SOF`, or `EOT`), a provisioning session begins. If not, the device proceeds
+normally with whatever data is already stored in NVRAM flash.
 
-The counterpart may send any subset of the three packets (private key, public key,
-configuration) in any order, or none at all. Only the packets that are received and
-verified are written to flash; the rest of the NVRAM page is preserved unchanged.
+Once a session is open it stays open until the counterpart sends `EOT`. The
+counterpart sends a `PING` keepalive every second so the operator can navigate menus
+between operations without the device timing out. **Flash is written atomically only
+when `EOT` is received** — the session is a transaction.
+
+The counterpart may send any subset of the three write packets (private key, public
+key, configuration) in any order, and may issue read-back queries at any point during
+the session. Only the sections that were written are updated in NVRAM; the rest of the
+1 KB page is preserved unchanged.
 
 ### LED feedback (PA2 — STAT\_FRIEND\_FOF)
 
@@ -74,12 +83,17 @@ LoRa operation takes over.
 
 #### Control bytes
 
-| Byte | Value | Sender | Meaning |
-|------|-------|--------|---------|
-| READY | `0xAA` | device | Ready to receive next packet |
-| ACK   | `0x06` | device | Packet accepted (ASCII ACK) |
-| NAK   | `0x15` | device | Packet rejected — retransmit (ASCII NAK) |
-| EOT   | `0x04` | counterpart | No more packets (ASCII EOT) |
+| Byte | Value | Direction | Meaning |
+|------|-------|-----------|---------|
+| `READY` | `0xAA` | device → counterpart | Device ready; session open |
+| `ACK`   | `0x06` | device → counterpart | Packet accepted or EOT acknowledged (ASCII ACK) |
+| `NAK`   | `0x15` | device → counterpart | CRC error — retransmit (ASCII NAK) |
+| `RJCT`  | `0xFF` | device → counterpart | Unsupported packet type |
+| `EOT`   | `0x04` | counterpart → device | End of session — commit flash (ASCII EOT) |
+| `PING`  | `0x05` | counterpart → device | Keepalive — resets idle timer (ASCII ENQ) |
+
+The device idle timeout is **5 seconds**. The counterpart sends `PING` every 1 second,
+so up to four consecutive pings may be lost without dropping the session.
 
 #### Packet frame
 
@@ -90,87 +104,113 @@ LoRa operation takes over.
 └────────┴────────┴────────┴─────────────────┴──────────┴──────────┘
 ```
 
-- **SOF** `0x55` — start-of-frame sync byte (alternating-bit pattern).
-- **TYPE** — identifies the payload:
+- **SOF** `0x55` — start-of-frame sync byte (alternating-bit pattern `01010101`).
+- **TYPE** — identifies the payload kind:
 
-  | Type | Value | Payload | Size |
-  |------|-------|---------|------|
-  | Private key  | `0xB1` | SECP256R1 scalar (raw bytes) | 32 B |
-  | Public key   | `0xB2` | SECP256R1 uncompressed point x\|\|y | 64 B |
-  | Configuration | `0xB3` | 4 × `uint32_t` little-endian (see below) | 16 B |
+  | Type constant | Value | Direction | Payload | Size |
+  |---------------|-------|-----------|---------|------|
+  | `PROV_TYPE_PRIVKEY`  | `0xB1` | counterpart → device | SECP256R1 private key scalar | 32 B |
+  | `PROV_TYPE_PUBKEY`   | `0xB2` | counterpart → device | SECP256R1 uncompressed public key x\|\|y | 64 B |
+  | `PROV_TYPE_CONFIG`   | `0xB3` | counterpart → device | Runtime config, 6 × `uint32_t` LE | 24 B |
+  | `PROV_GET_CONFIG`    | `0xB4` | counterpart → device | Query — no payload; device replies with `0xB3` | 0 B |
+  | `PROV_GET_PRIVKEY`   | `0xB5` | counterpart → device | Query — no payload; device replies with `0xB1` | 0 B |
+  | `PROV_GET_PUBKEY`    | `0xB6` | counterpart → device | Query — no payload; device replies with `0xB2` | 0 B |
 
-- **LEN** — payload byte count (fixed per type; receiver validates).
-- **CRC** — CRC-16/CCITT, polynomial `0x1021`, initial value `0xFFFF`, no
-  reflection, computed over `SOF || TYPE || LEN || PAYLOAD`, transmitted
-  big-endian (high byte first).
+- **LEN** — payload byte count (fixed per type; receiver validates and rejects mismatches).
+- **CRC** — CRC-16/CCITT, polynomial `0x1021`, initial value `0xFFFF`, no reflection,
+  computed over `SOF || TYPE || LEN || PAYLOAD`, transmitted big-endian (high byte first).
+
+Write packets (`0xB1–0xB3`) are acknowledged with `ACK` or `NAK`.
+Query packets (`0xB4–0xB6`) are answered with the corresponding data packet directly
+(no separate `ACK`); the data packet itself serves as the acknowledgement.
 
 #### Configuration payload layout
 
-| Offset | Field | Default |
-|--------|-------|---------|
-| 0 | `TxTimeoutMs` — LoRa transmit timeout | 500 |
-| 4 | `MainCycleDelayUs` — main loop period | 2000 |
-| 8 | `ResponseDelayToleranceMs` — max acceptable RTT | 500 |
-| 12 | `WatchdogTimeoutMs` — IWDG timeout | 1000 |
+All six fields are `uint32_t` in little-endian byte order (native STM32 storage format).
 
-All values are `uint32_t` in little-endian byte order (native STM32 storage format).
+| Offset | Size | Field | Default |
+|--------|------|-------|---------|
+| 0  | 4 B | `TxTimeoutMs` — LoRa transmit timeout | 500 ms |
+| 4  | 4 B | `TransponderMainCycleMs` — Transponder poll rate | 2 ms |
+| 8  | 4 B | `ChallengerMainCycleMs` — Challenger poll rate | 1000 ms |
+| 12 | 4 B | `ResponseWaitCycleDelayMs` — Challenger wait per cycle | 10 ms |
+| 16 | 4 B | `ResponseDelayToleranceMs` — Max acceptable challenge-response RTT | 500 ms |
+| 20 | 4 B | `WatchdogTimeoutMs` — IWDG reload timeout | 1000 ms |
+
+Total: 24 bytes.
 
 #### Session flow
 
+The session persists across multiple operations. The counterpart keeps the session
+alive with periodic `PING` bytes and commits the flash only at the end with `EOT`.
+
 ```
-Device                              Counterpart
-  │                                     │
-  │─── READY (0xAA) ──────────────────>│  "I am ready to receive"
-  │                                     │
-  │<── SOF | TYPE | LEN | PAYLOAD | CRC─│  packet (e.g. private key)
-  │    [verify CRC]                     │
-  │─── ACK (0x06) ────────────────────>│  accepted — send next
-  │                                     │
-  │<── SOF | TYPE | LEN | PAYLOAD | CRC─│  packet (e.g. public key)
-  │    [verify CRC — bad]               │
-  │─── NAK (0x15) ────────────────────>│  rejected — retransmit
-  │                                     │
-  │<── SOF | TYPE | LEN | PAYLOAD | CRC─│  same packet retransmitted
-  │    [verify CRC — OK]                │
-  │─── ACK (0x06) ────────────────────>│
-  │                                     │
-  │<── EOT (0x04) ─────────────────────│  no more packets
-  │─── ACK (0x06) ────────────────────>│
-  │    [erase NVRAM page, rewrite]      │
-  │    [LED steady ON → 3 s → OFF]      │
+Device                                  Counterpart (e.g. Raspberry Pi tool)
+  │                                           │
+  │──── READY (0xAA) ────────────────────────>│  session open
+  │                                           │
+  │<─── PING (0x05) ──────────────────────────│  keepalive (every ~1 s)
+  │                                           │
+  │<─── SOF│0xB1│32│<privkey>│CRC ───────────│  write private key
+  │     [verify CRC — OK]                     │
+  │──── ACK (0x06) ──────────────────────────>│
+  │                                           │
+  │<─── SOF│0xB5│0│CRC ───────────────────────│  read-back: GET_PRIVKEY
+  │──── SOF│0xB1│32│<privkey>│CRC ───────────>│  device replies with stored value
+  │                                           │
+  │<─── PING (0x05) ──────────────────────────│  operator navigating menus
+  │<─── PING (0x05) ──────────────────────────│
+  │                                           │
+  │<─── SOF│0xB3│24│<config>│CRC ────────────│  write configuration
+  │     [verify CRC — bad]                    │
+  │──── NAK (0x15) ──────────────────────────>│  CRC error — retransmit
+  │<─── SOF│0xB3│24│<config>│CRC ────────────│
+  │     [verify CRC — OK]                     │
+  │──── ACK (0x06) ──────────────────────────>│
+  │                                           │
+  │<─── EOT (0x04) ───────────────────────────│  end of session
+  │──── ACK (0x06) ──────────────────────────>│
+  │     [erase NVRAM page, rewrite]           │
+  │     [LED steady ON → 3 s → OFF]           │
 ```
 
-Key rules for the counterpart implementation:
+Rules for the counterpart implementation:
 
-1. Wait for READY before sending the first packet.
-2. After sending a packet, wait for ACK or NAK before proceeding.
-3. On NAK, retransmit the same packet. The device does not limit retries —
-   the counterpart is responsible for deciding when to give up.
-4. After the last packet (or if there is nothing to send), send EOT and
-   wait for ACK.
-5. The counterpart may send any combination of the three packet types. Packets
-   not sent leave the corresponding NVRAM section unchanged.
+1. Send `PING` every 1 second while idle. The device idle timeout is 5 seconds.
+2. After sending a write packet, wait for `ACK` or `NAK` before proceeding.
+3. On `NAK` (CRC error), retransmit the same packet. On `RJCT` (unknown type), abort.
+4. After sending a read-back query (`0xB4–0xB6`), read the response data packet
+   directly — the device does not send a separate `ACK`.
+5. When finished, send `EOT` and wait for `ACK`. Flash is written at this point.
+6. Any combination of write and read-back operations is allowed in a single session.
+   Sections not written during the session are left unchanged in NVRAM.
+
+#### Examples
+The file `tools/fof_prov.py` is a proved working sample which can be either
+used directly of extended to receive the keys in the automatic way.
 
 #### Packet sizes on wire
 
-| Packet | Bytes | Time at 9600 baud |
-|--------|-------|-------------------|
-| Private key  | 37 | ≈ 38 ms |
-| Public key   | 69 | ≈ 72 ms |
-| Configuration | 21 | ≈ 22 ms |
+| Packet | Wire bytes | Time at 9600 baud |
+|--------|-----------|-------------------|
+| Write private key  (`0xB1`) | 37 B | ≈ 38 ms |
+| Write public key   (`0xB2`) | 69 B | ≈ 72 ms |
+| Write configuration (`0xB3`) | 29 B | ≈ 30 ms |
+| Query (`0xB4`–`0xB6`)       |  5 B | < 1 ms |
+| PING / EOT / READY           |  1 B | < 1 ms |
 
 ### NVRAM flash layout
 
 All provisioned data shares a single 1 KB flash page at `0x0800FC00`.
-The full page is erased and rewritten atomically on each successful session.
+The full page is erased and rewritten atomically when `EOT` is received.
 
 ```
-0x0800FC00  ┌──────────────────────┐  4 B   Magic pattern {0xF0,0x0F,0xDE,0xAD}
-0x0800FC04  ├──────────────────────┤  32 B  FoF private key     (PROV_TYPE_PRIVKEY)
-0x0800FC24  ├──────────────────────┤  64 B  FoF remote public key (PROV_TYPE_PUBKEY)
-0x0800FC64  ├──────────────────────┤  16 B  Runtime configuration (PROV_TYPE_CONFIG)
-0x0800FC74  ├──────────────────────┤
-            │   (unused)           │
+0x0800FC00  ┌──────────────────────┐   4 B   Magic pattern {0xF0, 0x0F, 0xDE, 0xAD}
+0x0800FC04  ├──────────────────────┤  32 B   Private key  (SECP256R1 scalar)
+0x0800FC24  ├──────────────────────┤  64 B   Public key   (SECP256R1 x‖y uncompressed)
+0x0800FC64  ├──────────────────────┤  24 B   Runtime configuration (6 × uint32_t LE)
+0x0800FC7C  ├──────────────────────┤
+            │   (unused — 900 B)   │
 0x0800FFFF  └──────────────────────┘
 ```
 
