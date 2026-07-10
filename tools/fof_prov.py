@@ -730,6 +730,24 @@ def _file_line(label: str, path: Path, expected_size: int) -> str:
     return f"  {icon}  {label:<16} {str(path):<36} [{detail}]"
 
 
+def _show_key_file(path: Path, expected_len: int) -> None:
+    if not path.exists():
+        print(red(f"\n  ✗  File not found: {path}"))
+        return
+    try:
+        raw = load_key(str(path), expected_len)
+    except Exception as exc:
+        print(red(f"\n  ✗  {exc}"))
+        return
+    print(f"\n  File  : {path}  [{len(raw)} B]")
+    if expected_len == PRIVKEY_LEN:
+        print(f"  Key   : {raw[:4].hex()} … {raw[-4:].hex()}"
+              f"  {dim('(first / last 4 bytes shown)')}")
+    else:
+        print(f"  X     : {raw[:32].hex()}")
+        print(f"  Y     : {raw[32:].hex()}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  TUI menus
 # ─────────────────────────────────────────────────────────────────────────────
@@ -741,10 +759,9 @@ def menu_main(settings: Settings) -> None:
         _header(settings)
         choice = _choose([
             "Flash All          (private key + public key + config)",
-            "Flash Private Key",
-            "Flash Public Key",
-            "Flash Configuration",
-            "Get Configuration",
+            "Private Key",
+            "Public Key",
+            "Configuration",
             "Generate Key Pair",
             "Settings",
             "Disconnect" if _gs.conn else dim("Disconnect  (not connected)"),
@@ -752,7 +769,7 @@ def menu_main(settings: Settings) -> None:
 
         if choice == 0:
             if _gs.conn:
-                if _ask_yn("Write flash and disconnect?"):
+                if _ask_yn("Write flash before disconnect?"):
                     disconnect(commit=True)
                 else:
                     disconnect(commit=False)
@@ -760,22 +777,20 @@ def menu_main(settings: Settings) -> None:
         elif choice == 1:
             menu_flash_all(settings)
         elif choice == 2:
-            menu_flash_key(settings, PKT_PRIVKEY, "Private Key",
-                           settings.privkey_path(), PRIVKEY_LEN)
+            menu_key(settings, PKT_PRIVKEY, "Private Key",
+                     settings.privkey_path(), PRIVKEY_LEN)
         elif choice == 3:
-            menu_flash_key(settings, PKT_PUBKEY, "Public Key",
-                           settings.pubkey_path(), PUBKEY_LEN)
+            menu_key(settings, PKT_PUBKEY, "Public Key",
+                     settings.pubkey_path(), PUBKEY_LEN)
         elif choice == 4:
-            menu_flash_config(settings)
+            menu_config(settings)
         elif choice == 5:
-            menu_get_config(settings)
-        elif choice == 6:
             menu_generate_keys(settings)
-        elif choice == 7:
+        elif choice == 6:
             menu_settings(settings)
-        elif choice == 8:
+        elif choice == 7:
             if _gs.conn:
-                if _ask_yn("Write flash and disconnect?"):
+                if _ask_yn("Write flash before disconnect?"):
                     disconnect(commit=True)
                 else:
                     disconnect(commit=False)
@@ -823,24 +838,27 @@ def _collect_key_packets(settings: Settings) -> List[Tuple[int, bytes, str]]:
     return packets
 
 
-# ── Flash single key ──────────────────────────────────────────────────────────
+# ── Key sub-menu (Read / Write / Choose file) ─────────────────────────────────
 
-def menu_flash_key(settings: Settings, pkt_type: int, label: str,
-                   default_path: Path, expected_len: int) -> None:
+def menu_key(settings: Settings, pkt_type: int, label: str,
+             default_path: Path, expected_len: int) -> None:
     current_path = default_path
     while True:
         _clear()
-        _header(settings, f"Flash {label}")
+        _header(settings, label)
         print(_file_line(label, current_path, expected_len))
         print()
 
-        choice = _choose(["Start", "Choose file"])
+        choice = _choose(["Read", "Write", "Choose file"])
         if choice == 0:
             break
-        elif choice == 1:
+        elif choice == 1:  # Read — display file content
+            _show_key_file(current_path, expected_len)
+            _pause()
+        elif choice == 2:  # Write — flash file to device
             if not current_path.exists():
                 print(red(f"  ✗  File not found: {current_path}"))
-                print(dim("     Use option 2 to select a file."))
+                print(dim("     Use option 3 to select a file."))
                 _pause()
                 continue
             try:
@@ -851,7 +869,7 @@ def menu_flash_key(settings: Settings, pkt_type: int, label: str,
                 continue
             do_flash([(pkt_type, raw, label)], settings)
             _pause()
-        elif choice == 2:
+        elif choice == 3:  # Choose file
             try:
                 v = input(f"  Path [{current_path}]: ").strip()
             except (KeyboardInterrupt, EOFError):
@@ -860,24 +878,34 @@ def menu_flash_key(settings: Settings, pkt_type: int, label: str,
                 current_path = Path(v)
 
 
-# ── Flash Configuration ───────────────────────────────────────────────────────
+# ── Configuration sub-menu (Read / Write / Edit / Reset) ─────────────────────
 
-def menu_flash_config(settings: Settings) -> None:
+def menu_config(settings: Settings) -> None:
     while True:
         _clear()
-        _header(settings, "Flash Configuration")
+        _header(settings, "Configuration")
         _print_config(settings["config"])
         print()
-        choice = _choose(["Start", "Edit values", "Reset to defaults"])
+        choice = _choose(["Read from device", "Write to device",
+                          "Edit values", "Reset to defaults"])
         if choice == 0:
             break
-        elif choice == 1:
+        elif choice == 1:  # Read from device
+            result = do_get_config(settings)
+            if result is not None:
+                print(f"\n  {green('✓')}  Configuration received:\n")
+                _print_config(result)
+                if _ask_yn("Load these values into local settings?"):
+                    settings["config"] = result
+                    print(green("  Settings updated."))
+            _pause()
+        elif choice == 2:  # Write to device
             do_flash([(PKT_CONFIG, _pack_config(settings["config"]), "Configuration")],
                      settings)
             _pause()
-        elif choice == 2:
+        elif choice == 3:  # Edit values
             menu_edit_config(settings)
-        elif choice == 3:
+        elif choice == 4:  # Reset to defaults
             settings["config"] = _default_config()
             print(green("  Config reset to defaults."))
             _pause()
@@ -924,28 +952,6 @@ def _print_config(cfg: Dict[str, int]) -> None:
     for name, desc, default in CONFIG_FIELDS:
         print(f"  {name:<32}  {cfg.get(name, default):>6} ms   {dim(desc)}")
 
-
-# ── Get Configuration ─────────────────────────────────────────────────────────
-
-def menu_get_config(settings: Settings) -> None:
-    while True:
-        _clear()
-        _header(settings, "Get Configuration")
-        print("  Reads the current configuration from device NVRAM.")
-        print()
-
-        choice = _choose(["Start"])
-        if choice == 0:
-            break
-        elif choice == 1:
-            result = do_get_config(settings)
-            if result is not None:
-                print(f"\n  {green('✓')}  Configuration received:\n")
-                _print_config(result)
-                if _ask_yn("Load these values into local settings?"):
-                    settings["config"] = result
-                    print(green("  Settings updated."))
-            _pause()
 
 
 # ── Generate Key Pair ─────────────────────────────────────────────────────────
