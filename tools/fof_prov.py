@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-fof_prov.py — FoF STM32 field provisioning tool (Raspberry Pi peer)
+fof_prov.py — FoF STM32 Field Provisioning Tool
 
-Sends a private key, a public key, and/or a configuration update to the
-STM32 LoRa device via USART1 using the FoF provisioning protocol.
+Interactive TUI (and non-interactive CLI) for provisioning the STM32 LoRa
+device via USART1: send private key, public key, configuration data, and
+optionally read back the current configuration.
 
 Hardware connections (Raspberry Pi  →  STM32 Blue Pill):
   GPIO14 / pin 8  (UART TX)  →  PA10  (USART1_RX)
@@ -12,64 +13,80 @@ Hardware connections (Raspberry Pi  →  STM32 Blue Pill):
 
 Enable UART on the Pi:
   sudo raspi-config → Interface Options → Serial Port
-    - Login shell over serial: No
-    - Serial port hardware: Yes
-  → /dev/ttyAMA0 (or /dev/serial0) becomes the provisioning port.
+    Login shell over serial:  No
+    Serial port hardware:     Yes
 
 Dependencies:
   pip3 install pyserial
-  pip3 install cryptography   # optional — only needed for PEM key files
+  pip3 install cryptography   # optional — required only for PEM key files
+                              # also required for key generation (--generate)
 
-Supported key file formats:
-  raw binary  — 32 B (private key) or 64 B (public key)
-  hex text    — 64 or 128 hex chars in a .txt file (colons / spaces ignored)
-  PEM         — requires the 'cryptography' package
-
-Usage:
-  python3 fof_prov.py --help
+Supported key-file formats (for --private-key / --public-key):
+  raw binary  — 32 B (private) or 64 B (public)
+  hex text    — 64 or 128 hex chars in a text file (colons/spaces ignored)
+  PEM         — requires 'cryptography' package
 """
 
 import sys
+import os
+import json
+import copy
 import time
 import struct
 import textwrap
 import argparse
 import logging
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, List, Tuple, Dict, Any
 
 try:
     import serial
 except ImportError:
-    sys.exit("pyserial is not installed.  Run:  pip3 install pyserial")
+    sys.exit("pyserial not installed.  Run:  pip3 install pyserial")
 
 
-# ─── Protocol constants ───────────────────────────────────────────────────────
+# ── Protocol constants ────────────────────────────────────────────────────────
 
-PROV_READY  = 0xAA   # device  → peer  : ready for next packet
-PROV_ACK    = 0x06   # device  → peer  : packet accepted (ASCII ACK)
-PROV_NAK    = 0x15   # device  → peer  : CRC error — retransmit (ASCII NAK)
-PROV_EOT    = 0x04   # peer    → device: end of transmission (ASCII EOT)
-PROV_SOF    = 0x55   # peer    → device: start-of-frame byte
+PROV_READY   = 0xAA   # device  → peer  : ready for next packet
+PROV_ACK     = 0x06   # device  → peer  : packet accepted
+PROV_NAK     = 0x15   # device  → peer  : CRC error — retransmit
+PROV_RJCT    = 0xFF   # device  → peer  : request not supported
+PROV_EOT     = 0x04   # peer    → device: end of transmission
 
-PKT_PRIVKEY = 0xB1   # SECP256R1 private key scalar,  32 bytes
-PKT_PUBKEY  = 0xB2   # SECP256R1 public key (x‖y),   64 bytes
-PKT_CONFIG  = 0xB3   # runtime config, 4 × uint32_t LE, 16 bytes
+PROV_SOF         = 0x55   # packet start-of-frame byte
+PKT_PRIVKEY      = 0xB1   # SECP256R1 private key scalar   (32 B)
+PKT_PUBKEY       = 0xB2   # SECP256R1 public key  x‖y     (64 B)
+PKT_CONFIG       = 0xB3   # runtime config  6 × uint32_t   (24 B)
+PKT_GET_CONFIG   = 0xB4   # query: read back device config  (0 B payload)
 
 PRIVKEY_LEN = 32
 PUBKEY_LEN  = 64
-CONFIG_LEN  = 16     # 4 × uint32_t
+CONFIG_LEN  = 24    # 6 × uint32_t
 
-# Config field order matches NVRAM layout (see README § NVRAM flash layout)
-CONFIG_FIELDS: List[Tuple[str, int]] = [
-    ("TxTimeoutMs",              500),
-    ("MainCycleDelayUs",        2000),
-    ("ResponseDelayToleranceMs", 500),
-    ("WatchdogTimeoutMs",       1000),
+
+# ── Config field definitions (order matches NVRAM layout) ────────────────────
+
+CONFIG_FIELDS: List[Tuple[str, str, int]] = [
+    ("TxTimeoutMs",              "LoRa transmit timeout",                 500),
+    ("TransponderMainCycleMs",   "Transponder poll rate",                   2),
+    ("ChallengerMainCycleMs",    "Challenger poll rate",                 1000),
+    ("ResponseWaitCycleDelayMs", "Challenger wait per cycle for response",  10),
+    ("ResponseDelayToleranceMs", "Max acceptable challenge-response RTT",  500),
+    ("WatchdogTimeoutMs",        "Watchdog timeout",                      1000),
 ]
 
+def _default_config() -> Dict[str, int]:
+    return {f[0]: f[2] for f in CONFIG_FIELDS}
 
-# ─── ANSI colour helpers ──────────────────────────────────────────────────────
+def _pack_config(cfg: Dict[str, int]) -> bytes:
+    return struct.pack("<6I", *[cfg.get(f[0], f[2]) for f in CONFIG_FIELDS])
+
+def _unpack_config(data: bytes) -> Dict[str, int]:
+    vals = struct.unpack("<6I", data)
+    return {f[0]: v for f, v in zip(CONFIG_FIELDS, vals)}
+
+
+# ── ANSI colour helpers ───────────────────────────────────────────────────────
 
 _COLOR = sys.stdout.isatty()
 
@@ -81,12 +98,13 @@ def yellow(s: str) -> str: return _c("93", s)
 def red(s: str)    -> str: return _c("91", s)
 def cyan(s: str)   -> str: return _c("96", s)
 def bold(s: str)   -> str: return _c("1",  s)
+def dim(s: str)    -> str: return _c("2",  s)
 
 
-# ─── CRC-16/CCITT ─────────────────────────────────────────────────────────────
+# ── CRC-16/CCITT ─────────────────────────────────────────────────────────────
 
 def crc16_ccitt(data: bytes) -> int:
-    """CRC-16/CCITT — poly 0x1021, init 0xFFFF, no input/output reflection."""
+    """poly 0x1021, init 0xFFFF, no reflection — matches device implementation."""
     crc = 0xFFFF
     for b in data:
         crc ^= b << 8
@@ -95,96 +113,291 @@ def crc16_ccitt(data: bytes) -> int:
     return crc
 
 
-# ─── Packet construction ──────────────────────────────────────────────────────
+# ── Packet construction / parsing ─────────────────────────────────────────────
 
 def build_packet(pkt_type: int, payload: bytes) -> bytes:
-    """Return a complete wire packet: SOF | TYPE | LEN | PAYLOAD | CRC_HI | CRC_LO."""
+    """SOF | TYPE | LEN | PAYLOAD | CRC_HI | CRC_LO"""
     frame = bytes([PROV_SOF, pkt_type, len(payload)]) + payload
     crc   = crc16_ccitt(frame)
     return frame + bytes([crc >> 8, crc & 0xFF])
 
+def parse_packet(raw: bytes) -> Optional[Tuple[int, bytes]]:
+    """Parse a complete received packet. Returns (type, payload) or None."""
+    if len(raw) < 5 or raw[0] != PROV_SOF:
+        return None
+    pkt_len = raw[2]
+    if len(raw) != 3 + pkt_len + 2:
+        return None
+    rx_crc = (raw[-2] << 8) | raw[-1]
+    if rx_crc != crc16_ccitt(raw[:-2]):
+        return None
+    return raw[1], bytes(raw[3:3 + pkt_len])
 
-# ─── Key / config loading ─────────────────────────────────────────────────────
+
+# ── Key loading ───────────────────────────────────────────────────────────────
 
 def load_key(path: str, expected_len: int) -> bytes:
     """
-    Load raw key bytes from *path*.  Tried in order:
-      1. PEM  (requires the `cryptography` package)
-      2. Hex text  (stripped of whitespace and colons)
+    Load raw key bytes.  Tried in order:
+      1. PEM  (requires 'cryptography')
+      2. Hex text  (64 or 128 hex chars, colons/spaces stripped)
       3. Raw binary
-    Raises ValueError / RuntimeError on failure.
     """
     data = Path(path).read_bytes()
 
-    # ── PEM ──────────────────────────────────────────────────────────────────
     if data.lstrip().startswith(b"-----"):
         try:
             from cryptography.hazmat.primitives.serialization import (
-                load_pem_private_key, load_pem_public_key,
-            )
+                load_pem_private_key, load_pem_public_key)
             from cryptography.hazmat.primitives.asymmetric.ec import (
-                EllipticCurvePrivateKey, EllipticCurvePublicKey,
-            )
+                EllipticCurvePrivateKey, EllipticCurvePublicKey)
         except ImportError:
             raise RuntimeError(
-                "PEM file detected but 'cryptography' is not installed.\n"
-                "  pip3 install cryptography\n"
-                "Or convert the key to raw binary / hex first."
-            )
-
+                "PEM file requires 'cryptography'.  Run:  pip3 install cryptography")
         if expected_len == PRIVKEY_LEN:
-            try:
-                key = load_pem_private_key(data, password=None)
-                if isinstance(key, EllipticCurvePrivateKey):
-                    return key.private_numbers().private_value.to_bytes(32, "big")
-            except Exception as exc:
-                raise ValueError(f"Cannot parse PEM private key: {exc}") from exc
+            key = load_pem_private_key(data, password=None)
+            if not isinstance(key, EllipticCurvePrivateKey):
+                raise ValueError("Not an EC private key")
+            return key.private_numbers().private_value.to_bytes(32, "big")
+        key = load_pem_public_key(data)
+        if not isinstance(key, EllipticCurvePublicKey):
+            raise ValueError("Not an EC public key")
+        n = key.public_numbers()
+        return n.x.to_bytes(32, "big") + n.y.to_bytes(32, "big")
 
-        if expected_len == PUBKEY_LEN:
-            try:
-                key = load_pem_public_key(data)
-                if isinstance(key, EllipticCurvePublicKey):
-                    n = key.public_numbers()
-                    return n.x.to_bytes(32, "big") + n.y.to_bytes(32, "big")
-            except Exception as exc:
-                raise ValueError(f"Cannot parse PEM public key: {exc}") from exc
+    hex_str = "".join(c for c in data.decode("ascii", errors="ignore")
+                      if c in "0123456789abcdefABCDEF")
+    if len(hex_str) == expected_len * 2:
+        return bytes.fromhex(hex_str)
 
-        raise ValueError("PEM file does not match expected EC key type.")
-
-    # ── Hex text ──────────────────────────────────────────────────────────────
-    try:
-        hex_str = data.decode("ascii", errors="ignore")
-        hex_str = "".join(c for c in hex_str if c in "0123456789abcdefABCDEF")
-        if len(hex_str) == expected_len * 2:
-            return bytes.fromhex(hex_str)
-    except Exception:
-        pass
-
-    # ── Raw binary ────────────────────────────────────────────────────────────
     if len(data) == expected_len:
         return data
 
     raise ValueError(
-        f"File '{path}': expected {expected_len} bytes, "
-        f"got {len(data)} — not valid raw binary, hex text, or PEM."
-    )
+        f"Expected {expected_len} bytes; got {len(data)}.  "
+        "File must be raw binary, hex text, or PEM.")
 
 
-def build_config(args: argparse.Namespace) -> bytes:
-    """Pack the four config fields into 16 bytes (little-endian uint32_t × 4)."""
-    defaults = dict(CONFIG_FIELDS)
-    vals = [
-        args.tx_timeout    if args.tx_timeout    is not None else defaults["TxTimeoutMs"],
-        args.main_delay    if args.main_delay     is not None else defaults["MainCycleDelayUs"],
-        args.rtt_tolerance if args.rtt_tolerance  is not None else defaults["ResponseDelayToleranceMs"],
-        args.watchdog      if args.watchdog        is not None else defaults["WatchdogTimeoutMs"],
-    ]
-    return struct.pack("<4I", *vals)
+# ── Key generation ────────────────────────────────────────────────────────────
+
+def generate_keypair(out_dir: Path) -> Tuple[bytes, bytes]:
+    """Generate a SECP256R1 keypair and save raw bytes to out_dir.
+    Returns (private_bytes, public_bytes).
+    Requires 'cryptography'.
+    """
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ec import (
+            generate_private_key, SECP256R1)
+        from cryptography.hazmat.backends import default_backend
+    except ImportError:
+        raise RuntimeError(
+            "Key generation requires 'cryptography'.  Run:  pip3 install cryptography")
+
+    priv_key  = generate_private_key(SECP256R1(), default_backend())
+    priv_nums = priv_key.private_numbers()
+    pub_nums  = priv_key.public_key().public_numbers()
+
+    priv_bytes = priv_nums.private_value.to_bytes(32, "big")
+    pub_bytes  = (pub_nums.x.to_bytes(32, "big") + pub_nums.y.to_bytes(32, "big"))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "private.bin").write_bytes(priv_bytes)
+    (out_dir / "public.bin").write_bytes(pub_bytes)
+    return priv_bytes, pub_bytes
 
 
-# ─── Hex dump ─────────────────────────────────────────────────────────────────
+# ── Settings (JSON persistence) ───────────────────────────────────────────────
 
-def hex_dump(label: str, data: bytes, cols: int = 16) -> None:
+_CFG_FILE = Path(__file__).with_name(".fof_prov.cfg")
+
+class Settings:
+    _DEFAULTS: Dict[str, Any] = {
+        "port":         "/dev/serial0",
+        "baud":         9600,
+        "max_retries":  3,
+        "wait_timeout": 8.0,
+        "byte_timeout": 5.0,
+        "key_dir":      "keys",
+        "verbose":      False,
+        "config":       {f[0]: f[2] for f in CONFIG_FIELDS},
+    }
+
+    def __init__(self) -> None:
+        self._data: Dict[str, Any] = copy.deepcopy(self._DEFAULTS)
+        try:
+            if _CFG_FILE.exists():
+                loaded = json.loads(_CFG_FILE.read_text())
+                # Deep-merge: top-level keys
+                self._data.update(loaded)
+                # Deep-merge: config sub-dict
+                merged_cfg = copy.deepcopy(self._DEFAULTS["config"])
+                merged_cfg.update(loaded.get("config", {}))
+                self._data["config"] = merged_cfg
+        except Exception:
+            pass
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self._data[key] = value
+        self._save()
+
+    def _save(self) -> None:
+        try:
+            _CFG_FILE.write_text(json.dumps(self._data, indent=2))
+        except Exception:
+            pass
+
+    def privkey_path(self) -> Path:
+        return Path(self["key_dir"]) / "private.bin"
+
+    def pubkey_path(self) -> Path:
+        return Path(self["key_dir"]) / "public.bin"
+
+    def key_dir_path(self) -> Path:
+        return Path(self["key_dir"])
+
+
+# ── Provisioning session ──────────────────────────────────────────────────────
+
+class ProvSession:
+    def __init__(self, port: serial.Serial, *,
+                 max_retries: int = 3,
+                 byte_timeout: float = 5.0,
+                 verbose: bool = False):
+        self.port         = port
+        self.max_retries  = max_retries
+        self.byte_timeout = byte_timeout
+        self.verbose      = verbose
+        self._sent  = 0
+        self._acked = 0
+
+    def _log(self, msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        print(f"  [{ts}]  {msg}")
+
+    def _recv(self, timeout: float) -> Optional[int]:
+        self.port.timeout = timeout
+        b = self.port.read(1)
+        return b[0] if b else None
+
+    # ── Phase 1 ───────────────────────────────────────────────────────────────
+
+    def wait_for_ready(self, timeout: float = 8.0) -> bool:
+        print(f"\n  {cyan('Waiting for device READY…')}")
+        deadline = time.monotonic() + timeout
+        dots = 0
+        while time.monotonic() < deadline:
+            b = self._recv(timeout=min(0.5, deadline - time.monotonic()))
+            if b is None:
+                dots += 1
+                print(f"  {'.' * (dots % 6 + 1):<7}", end="\r", flush=True)
+                continue
+            if b == PROV_READY:
+                print()
+                self._log(green(f"READY  (0x{b:02X})"))
+                return True
+        print()
+        self._log(red("Timeout — no READY signal from device"))
+        return False
+
+    # ── Phase 2 — write packet ────────────────────────────────────────────────
+
+    def send_packet(self, pkt_type: int, payload: bytes, label: str) -> bool:
+        TYPE_STR = {PKT_PRIVKEY: "PRIVKEY/0xB1",
+                    PKT_PUBKEY:  "PUBKEY/0xB2",
+                    PKT_CONFIG:  "CONFIG/0xB3"}
+        packet = build_packet(pkt_type, payload)
+        print(f"\n  {bold('▸  ' + label)}")
+        print(f"     type={TYPE_STR.get(pkt_type, hex(pkt_type))}"
+              f"  payload={len(payload)} B  wire={len(packet)} B")
+        if self.verbose:
+            _hex_dump("Payload", payload)
+            _hex_dump("Packet ", packet)
+
+        for attempt in range(1, self.max_retries + 1):
+            if attempt > 1:
+                self._log(yellow(f"Retry {attempt}/{self.max_retries}…"))
+            self.port.write(packet)
+            self.port.flush()
+            self._sent += 1
+
+            resp = self._recv(timeout=self.byte_timeout)
+            if resp is None:
+                self._log(red(f"Timeout waiting for ACK/NAK  (attempt {attempt})"))
+                continue
+            if resp == PROV_ACK:
+                self._log(green("ACK  ✓"))
+                self._acked += 1
+                return True
+            if resp == PROV_NAK:
+                self._log(yellow("NAK  ✗  CRC mismatch — retransmitting"))
+                continue
+            self._log(yellow(f"Unexpected response 0x{resp:02X} — retrying"))
+
+        self._log(red(f"Giving up after {self.max_retries} attempts."))
+        return False
+
+    # ── Phase 2 — read config (GET_CONFIG) ───────────────────────────────────
+
+    def get_config(self) -> Optional[Dict[str, int]]:
+        """
+        Send a GET_CONFIG request and return the device config dict.
+        Returns None if the device sends PROV_RJCT or does not support the command.
+        """
+        packet = build_packet(PKT_GET_CONFIG, b"")
+        print(f"\n  {bold('▸  GET_CONFIG request')}")
+        if self.verbose:
+            _hex_dump("Packet", packet)
+
+        self.port.write(packet)
+        self.port.flush()
+
+        resp = self._recv(timeout=self.byte_timeout)
+        if resp is None:
+            self._log(red("Timeout — no response from device"))
+            return None
+
+        if resp in (PROV_RJCT, PROV_NAK):
+            print()
+            print(f"  {red('✗')}  This device doesn't support reading out the configuration.")
+            return None
+
+        # Future: device sends ACK then a config packet back.
+        # For now any other byte is unexpected.
+        self._log(yellow(f"Unexpected response 0x{resp:02X}"))
+        return None
+
+    # ── Phase 3 ───────────────────────────────────────────────────────────────
+
+    def send_eot(self) -> bool:
+        print(f"\n  {bold('▸  EOT')}  (end of transmission)")
+        self.port.write(bytes([PROV_EOT]))
+        self.port.flush()
+        resp = self._recv(timeout=self.byte_timeout)
+        if resp == PROV_ACK:
+            self._log(green("ACK  ✓  device writing flash…"))
+            time.sleep(0.8)
+            return True
+        got = f"0x{resp:02X}" if resp is not None else "timeout"
+        self._log(red(f"No ACK for EOT (got {got})"))
+        return False
+
+    def print_summary(self, success: bool) -> None:
+        sep = "─" * 46
+        print(f"\n{sep}")
+        print(bold("  Summary"))
+        print(f"  Packets sent   :  {self._sent}")
+        print(f"  Packets ACKed  :  {self._acked}")
+        print(f"  Result         :  "
+              + (green("SUCCESS — flash updated") if success else red("FAILED")))
+        print(sep)
+
+
+# ── Hex dump ──────────────────────────────────────────────────────────────────
+
+def _hex_dump(label: str, data: bytes, cols: int = 16) -> None:
     print(f"   {label}  ({len(data)} B):")
     for i in range(0, len(data), cols):
         chunk    = data[i:i + cols]
@@ -193,366 +406,652 @@ def hex_dump(label: str, data: bytes, cols: int = 16) -> None:
         print(f"     {i:04x}  {hex_part:<{cols * 3}} {asc_part}")
 
 
-# ─── Provisioning session ─────────────────────────────────────────────────────
+# ── Port helpers ──────────────────────────────────────────────────────────────
 
-class ProvSession:
-    """
-    Manages one provisioning session against the STM32 device.
+def _resolve_port(port: str) -> str:
+    try:
+        p = Path(port)
+        if p.is_symlink():
+            return f"{port} ({p.resolve()})"
+    except Exception:
+        pass
+    return port
 
-    Protocol flow (this class is the "counterpart"):
-      1. wait_for_ready()          — waits for 0xAA from device
-      2. send_packet() × N         — each sends SOF|TYPE|LEN|PAYLOAD|CRC,
-                                     retries on NAK, aborts on timeout
-      3. send_eot()                — sends 0x04, waits for final ACK
-    """
-
-    def __init__(self, port: serial.Serial, *,
-                 max_retries: int = 3,
-                 interactive: bool = False,
-                 dry_run: bool = False,
-                 byte_timeout: float = 5.0,
-                 verbose: bool = False):
-        self.port         = port
-        self.max_retries  = max_retries
-        self.interactive  = interactive
-        self.dry_run      = dry_run
-        self.byte_timeout = byte_timeout
-        self.verbose      = verbose
-        self._sent  = 0
-        self._acked = 0
-
-    # ── Logging ───────────────────────────────────────────────────────────────
-
-    def _log(self, msg: str) -> None:
-        ts = time.strftime("%H:%M:%S")
-        print(f"  [{ts}]  {msg}")
-
-    # ── Low-level I/O ─────────────────────────────────────────────────────────
-
-    def _recv(self, timeout: float) -> Optional[int]:
-        """Read one byte within *timeout* seconds.  Returns None on timeout."""
-        self.port.timeout = timeout
-        b = self.port.read(1)
-        return b[0] if b else None
-
-    # ── Phase 1 — wait for READY ──────────────────────────────────────────────
-
-    def wait_for_ready(self, timeout: float = 8.0) -> bool:
-        """
-        Block until the device sends READY (0xAA).
-        The device sends up to 3 × READY at 2-second intervals on power-up.
-        Returns False if no READY arrives within *timeout* seconds.
-        """
-        print(f"\n{cyan(bold('◈  Waiting for READY from device…'))}")
-        print(f"   Port {self.port.name}  │  {self.port.baudrate} baud  │  8N1")
-        print(f"   (device sends up to 3 READY pulses, 2 s apart, on power-up)\n")
-
-        deadline = time.monotonic() + timeout
-        spinner  = 0
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            b = self._recv(timeout=min(0.5, remaining))
-            if b is None:
-                spinner += 1
-                print(f"   {'.' * (spinner % 6 + 1):<7}", end="\r", flush=True)
-                continue
-            if b == PROV_READY:
-                print()
-                self._log(green(f"READY received  (0x{b:02X})"))
-                return True
-            logging.debug("ignored byte 0x%02X while waiting for READY", b)
-
-        print()
-        self._log(red(f"Timeout — no READY signal within {timeout:.0f} s"))
-        return False
-
-    # ── Phase 2 — send a packet ───────────────────────────────────────────────
-
-    def send_packet(self, pkt_type: int, payload: bytes, label: str) -> bool:
-        """
-        Transmit *payload* as a packet of *pkt_type* and collect ACK.
-        Returns True on success, False on unrecoverable failure.
-        In interactive mode the user may skip a packet (returns True) or abort
-        the whole session (returns False).
-        """
-        TYPE_NAMES = {PKT_PRIVKEY: "PRIVKEY/0xB1",
-                      PKT_PUBKEY:  "PUBKEY/0xB2",
-                      PKT_CONFIG:  "CONFIG/0xB3"}
-        tname  = TYPE_NAMES.get(pkt_type, f"0x{pkt_type:02X}")
-        packet = build_packet(pkt_type, payload)
-
-        print(f"\n{bold('▸  ' + label)}")
-        print(f"   type={tname}  payload={len(payload)} B  wire={len(packet)} B")
-
-        if self.verbose:
-            hex_dump("Payload", payload)
-            hex_dump("Packet ", packet)
-
-        if self.interactive:
-            choice = input("   Send? [Y / n=abort / s=skip]  ").strip().lower()
-            if choice in ("n", "q"):
-                self._log(yellow("Aborted by user."))
-                return False
-            if choice == "s":
-                self._log(yellow("Skipped."))
-                return True   # skip is not an error
-
-        if self.dry_run:
-            self._log(yellow("[DRY RUN] packet built but not transmitted."))
-            return True
-
-        for attempt in range(1, self.max_retries + 1):
-            if attempt > 1:
-                self._log(yellow(f"Retry {attempt}/{self.max_retries}…"))
-
-            self.port.write(packet)
-            self.port.flush()
-            self._sent += 1
-
-            resp = self._recv(timeout=self.byte_timeout)
-
-            if resp is None:
-                self._log(red(f"Timeout waiting for ACK/NAK  (attempt {attempt})"))
-                if self.interactive and attempt < self.max_retries:
-                    if input("   Retry? [Y/n]  ").strip().lower() == "n":
-                        return False
-                continue
-
-            if resp == PROV_ACK:
-                self._log(green("ACK  ✓  packet accepted"))
-                self._acked += 1
-                return True
-
-            if resp == PROV_NAK:
-                self._log(yellow("NAK  ✗  CRC mismatch on device — retransmitting"))
-                if self.interactive and attempt < self.max_retries:
-                    if input("   Retry? [Y/n]  ").strip().lower() == "n":
-                        return False
-                continue
-
-            self._log(yellow(f"Unexpected response 0x{resp:02X} — retrying"))
-
-        self._log(red(f"Giving up after {self.max_retries} attempts."))
-        return False
-
-    # ── Phase 3 — end of transmission ─────────────────────────────────────────
-
-    def send_eot(self) -> bool:
-        """
-        Send EOT (0x04) and wait for the final ACK from the device.
-        The device will erase and rewrite the NVRAM flash page after ACK.
-        """
-        print(f"\n{bold('▸  EOT')}  (end of transmission)")
-
-        if self.dry_run:
-            self._log(yellow("[DRY RUN] EOT not transmitted."))
-            return True
-
-        self.port.write(bytes([PROV_EOT]))
-        self.port.flush()
-
-        resp = self._recv(timeout=self.byte_timeout)
-        if resp == PROV_ACK:
-            self._log(green("ACK  ✓  device writing flash…"))
-            # Allow time for flash erase + reprogram (512 half-words × HAL overhead)
-            time.sleep(0.8)
-            return True
-
-        got = f"0x{resp:02X}" if resp is not None else "timeout"
-        self._log(red(f"No ACK for EOT (got {got})"))
-        return False
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-
-    def print_summary(self, success: bool) -> None:
-        sep = "─" * 46
-        print(f"\n{sep}")
-        print(bold("  Session summary"))
-        print(f"  Packets sent    :  {self._sent}")
-        print(f"  Packets ACKed   :  {self._acked}")
-        result = green("SUCCESS — flash updated") if success else red("FAILED")
-        print(f"  Result          :  {result}")
-        print(sep)
-
-
-# ─── Argument parser ──────────────────────────────────────────────────────────
-
-def make_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        prog="fof_prov.py",
-        description="FoF STM32 field provisioning tool — Raspberry Pi peer",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""\
-        key-file formats:
-          raw binary  — 32 B (private key) or 64 B (public key)
-          hex text    — 64 or 128 hex digits in a .txt file (colons/spaces ignored)
-          PEM         — requires:  pip3 install cryptography
-
-        examples:
-          # provision all three packets
-          %(prog)s --port /dev/ttyAMA0 \\
-              --private-key priv.bin --public-key pub.bin \\
-              --tx-timeout 500 --main-delay 2000
-
-          # update only the private key
-          %(prog)s --port /dev/ttyAMA0 --private-key priv.bin
-
-          # update config only, confirm each step interactively
-          %(prog)s --port /dev/ttyAMA0 --tx-timeout 1000 --watchdog 2000 --interactive
-
-          # inspect packet bytes without transmitting anything
-          %(prog)s --port /dev/ttyAMA0 --public-key pub.hex --dry-run -v
-        """),
-    )
-
-    g = ap.add_argument_group("serial port")
-    g.add_argument("--port", default="/dev/ttyAMA0",
-                   help="UART device  (default: /dev/ttyAMA0)")
-    g.add_argument("--baud", type=int, default=9600,
-                   help="baud rate  (default: 9600)")
-
-    g = ap.add_argument_group("key packets")
-    g.add_argument("--private-key", metavar="FILE",
-                   help="private key — 32-byte SECP256R1 scalar")
-    g.add_argument("--public-key", metavar="FILE",
-                   help="public key  — 64-byte uncompressed SECP256R1 point (x‖y)")
-
-    g = ap.add_argument_group("config packet  (sent when any flag is provided)")
-    g.add_argument("--tx-timeout",    type=int, metavar="MS",
-                   help="Cfg_TxTimeoutMs                (default: 500)")
-    g.add_argument("--main-delay",    type=int, metavar="US",
-                   help="Cfg_MainCycleDelayUs            (default: 2000)")
-    g.add_argument("--rtt-tolerance", type=int, metavar="MS",
-                   help="Cfg_ResponseDelayToleranceMs   (default: 500)")
-    g.add_argument("--watchdog",      type=int, metavar="MS",
-                   help="Cfg_WatchdogTimeoutMs           (default: 1000)")
-
-    g = ap.add_argument_group("behaviour")
-    g.add_argument("--interactive", action="store_true",
-                   help="prompt before each packet; allow skip / abort / retry")
-    g.add_argument("--dry-run", action="store_true",
-                   help="build packets and print them — do not open the serial port")
-    g.add_argument("--max-retries", type=int, default=3, metavar="N",
-                   help="max NAK retries per packet  (default: 3)")
-    g.add_argument("--wait", type=float, default=8.0, metavar="SECS",
-                   help="seconds to wait for device READY  (default: 8)")
-    g.add_argument("--byte-timeout", type=float, default=5.0, metavar="SECS",
-                   help="per-byte receive timeout  (default: 5)")
-    g.add_argument("-v", "--verbose", action="store_true",
-                   help="show hex dumps of all packets")
-
-    return ap
-
-
-# ─── Entry point ─────────────────────────────────────────────────────────────
-
-def main() -> int:
-    ap   = make_parser()
-    args = ap.parse_args()
-
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
-                        format="%(message)s")
-
-    # ── Collect packets to send ───────────────────────────────────────────────
-    packets: List[Tuple[int, bytes, str]] = []   # (type, payload, label)
-    load_errors: List[str] = []
-
-    if args.private_key:
-        try:
-            raw = load_key(args.private_key, PRIVKEY_LEN)
-            packets.append((PKT_PRIVKEY, raw, "Private Key  (PRIVKEY 0xB1)"))
-        except Exception as exc:
-            load_errors.append(f"--private-key: {exc}")
-
-    if args.public_key:
-        try:
-            raw = load_key(args.public_key, PUBKEY_LEN)
-            packets.append((PKT_PUBKEY, raw, "Public Key   (PUBKEY 0xB2)"))
-        except Exception as exc:
-            load_errors.append(f"--public-key: {exc}")
-
-    config_args = (args.tx_timeout, args.main_delay, args.rtt_tolerance, args.watchdog)
-    if any(v is not None for v in config_args):
-        payload = build_config(args)
-        vals = struct.unpack("<4I", payload)
-        label = (
-            f"Config       (CONFIG 0xB3)\n"
-            f"   TxTimeoutMs={vals[0]}  MainCycleDelayUs={vals[1]}"
-            f"  RttTolerance={vals[2]}  WatchdogTimeout={vals[3]}"
+def _open_port(settings: Settings) -> Optional[serial.Serial]:
+    try:
+        ser = serial.Serial(
+            port=settings["port"],
+            baudrate=settings["baud"],
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
         )
-        packets.append((PKT_CONFIG, payload, label))
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        return ser
+    except serial.SerialException as exc:
+        print(red(f"\n  Cannot open {settings['port']}: {exc}"))
+        return None
 
-    if load_errors:
-        for err in load_errors:
-            print(red(f"Error: {err}"))
-        return 1
 
-    if not packets:
-        print(yellow("Nothing to send."))
-        print("Specify at least one of: --private-key  --public-key  --tx-timeout"
-              "  --main-delay  --rtt-tolerance  --watchdog")
-        ap.print_usage()
-        return 1
+# ── Flash / get-config operations ─────────────────────────────────────────────
 
-    # ── Print plan ────────────────────────────────────────────────────────────
-    print(bold(f"\nFoF provisioning  —  {len(packets)} packet(s) scheduled:"))
-    for i, (_, payload, label) in enumerate(packets, 1):
-        first_line = label.split("\n")[0]
-        print(f"  {i}. {first_line}  ({len(payload)} B payload)")
+def do_flash(packets: List[Tuple[int, bytes, str]], settings: Settings) -> bool:
+    """Open port, send packets, send EOT.  Returns success."""
+    ser = _open_port(settings)
+    if ser is None:
+        return False
 
-    # ── Open serial port ──────────────────────────────────────────────────────
-    if args.dry_run:
-        ser = None
-        print(yellow("\n[DRY RUN] serial port will not be opened."))
-    else:
-        try:
-            ser = serial.Serial(
-                port=args.port,
-                baudrate=args.baud,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=args.byte_timeout,
-            )
-            ser.reset_input_buffer()
-            ser.reset_output_buffer()
-        except serial.SerialException as exc:
-            print(red(f"\nCannot open {args.port}: {exc}"))
-            return 1
-
-    # ── Run session ───────────────────────────────────────────────────────────
-    sess = ProvSession(
-        port=ser,
-        max_retries=args.max_retries,
-        interactive=args.interactive,
-        dry_run=args.dry_run,
-        byte_timeout=args.byte_timeout,
-        verbose=args.verbose,
-    )
-
+    sess = ProvSession(ser,
+                       max_retries=settings["max_retries"],
+                       byte_timeout=settings["byte_timeout"],
+                       verbose=settings["verbose"])
     success = True
-
-    if not args.dry_run:
-        if not sess.wait_for_ready(timeout=args.wait):
-            sess.print_summary(success=False)
-            if ser:
-                ser.close()
-            return 1
+    if not sess.wait_for_ready(timeout=settings["wait_timeout"]):
+        ser.close()
+        return False
 
     for pkt_type, payload, label in packets:
         if not sess.send_packet(pkt_type, payload, label):
             success = False
-            if not args.interactive:
-                break   # non-interactive: abort on first failure
+            break
 
     if success:
         success = sess.send_eot()
 
-    if ser:
-        ser.close()
-
+    ser.close()
     sess.print_summary(success)
+    return success
+
+def do_get_config(settings: Settings) -> Optional[Dict[str, int]]:
+    """Open port, send GET_CONFIG, return config dict or None."""
+    ser = _open_port(settings)
+    if ser is None:
+        return None
+
+    sess = ProvSession(ser,
+                       max_retries=1,
+                       byte_timeout=settings["byte_timeout"],
+                       verbose=settings["verbose"])
+    result = None
+    if sess.wait_for_ready(timeout=settings["wait_timeout"]):
+        result = sess.get_config()
+        # Always end the session gracefully
+        ser.write(bytes([PROV_EOT]))
+        ser.flush()
+        ser.read(1)   # consume ACK (best-effort)
+
+    ser.close()
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TUI — helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _clear() -> None:
+    os.system("cls" if os.name == "nt" else "clear")
+
+def _header(settings: Settings, subtitle: str = "") -> None:
+    port_str = _resolve_port(settings["port"])
+    box_w = 50
+    print("╔" + "═" * box_w + "╗")
+    print(f"║  {'FoF Field Provisioning Tool':<{box_w - 2}}║")
+    print(f"║  {port_str:<{box_w - 2}}║")
+    print("╚" + "═" * box_w + "╝")
+    if subtitle:
+        print(f"\n── {subtitle} " + "─" * max(0, box_w - len(subtitle) - 1))
+    print()
+
+def _pause(msg: str = "Press Enter to return…") -> None:
+    try:
+        input(f"\n  {msg}")
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+def _choose(options: List[str], *, zero_label: str = "Back") -> int:
+    """Print numbered options; return 1-based selection or 0 for zero_label."""
+    for i, label in enumerate(options, 1):
+        print(f"  {i}.  {label}")
+    print(f"  0.  {zero_label}")
+    print()
+    while True:
+        try:
+            raw = input("  Select: ").strip()
+            n   = int(raw)
+            if 0 <= n <= len(options):
+                return n
+        except (ValueError, KeyboardInterrupt, EOFError):
+            pass
+        print(f"  Enter 0–{len(options)}.")
+
+def _ask_yn(prompt: str, default: bool = True) -> bool:
+    hint = "[Y/n]" if default else "[y/N]"
+    try:
+        raw = input(f"  {prompt} {hint}: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return default
+    if not raw:
+        return default
+    return raw.startswith("y")
+
+def _file_line(label: str, path: Path, expected_size: int) -> str:
+    if path.exists():
+        size = path.stat().st_size
+        size_ok = size == expected_size
+        icon = green("✓") if size_ok else yellow("!")
+        detail = f"{size} B" + ("" if size_ok else f"  ← expected {expected_size}")
+    else:
+        icon   = red("✗")
+        detail = "not found"
+    return f"  {icon}  {label:<16} {str(path):<34}  [{detail}]"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TUI — menus
+# ─────────────────────────────────────────────────────────────────────────────
+
+def menu_main(settings: Settings) -> None:
+    while True:
+        _clear()
+        _header(settings)
+        choice = _choose([
+            "Flash All          (private key + public key + config)",
+            "Flash Private Key",
+            "Flash Public Key",
+            "Flash Configuration",
+            "Get Configuration",
+            "Generate Key Pair",
+            "Settings",
+        ], zero_label="Exit")
+        if choice == 0:
+            break
+        elif choice == 1:
+            menu_flash_all(settings)
+        elif choice == 2:
+            menu_flash_key(settings, PKT_PRIVKEY, "Private Key",
+                           settings.privkey_path(), PRIVKEY_LEN)
+        elif choice == 3:
+            menu_flash_key(settings, PKT_PUBKEY, "Public Key",
+                           settings.pubkey_path(), PUBKEY_LEN)
+        elif choice == 4:
+            menu_flash_config(settings)
+        elif choice == 5:
+            menu_get_config(settings)
+        elif choice == 6:
+            menu_generate_keys(settings)
+        elif choice == 7:
+            menu_settings(settings)
+
+
+# ── Flash All ─────────────────────────────────────────────────────────────────
+
+def menu_flash_all(settings: Settings) -> None:
+    while True:
+        _clear()
+        _header(settings, "Flash All")
+        priv_path = settings.privkey_path()
+        pub_path  = settings.pubkey_path()
+        print(_file_line("Private key", priv_path,  PRIVKEY_LEN))
+        print(_file_line("Public key",  pub_path,   PUBKEY_LEN))
+        print(f"  {green('✓')}  {'Config':<16} (from settings)  [6 fields]")
+        print()
+
+        choice = _choose(["Start", "Edit config values"])
+        if choice == 0:
+            break
+        elif choice == 1:
+            packets = _collect_key_packets(settings)
+            packets.append((PKT_CONFIG, _pack_config(settings["config"]), "Configuration"))
+            if not packets:
+                print(red("  No data to send — all key files missing."))
+                _pause()
+            else:
+                do_flash(packets, settings)
+                _pause()
+        elif choice == 2:
+            menu_edit_config(settings)
+
+def _collect_key_packets(settings: Settings) -> List[Tuple[int, bytes, str]]:
+    """Load whichever key files exist; warn about missing ones."""
+    packets: List[Tuple[int, bytes, str]] = []
+    for path, pkt_type, label, expected_len in [
+        (settings.privkey_path(), PKT_PRIVKEY, "Private Key", PRIVKEY_LEN),
+        (settings.pubkey_path(),  PKT_PUBKEY,  "Public Key",  PUBKEY_LEN),
+    ]:
+        if path.exists():
+            try:
+                raw = load_key(str(path), expected_len)
+                packets.append((pkt_type, raw, label))
+            except Exception as exc:
+                print(yellow(f"  ! Skipping {label}: {exc}"))
+        else:
+            print(yellow(f"  ! Skipping {label}: file not found"))
+    return packets
+
+
+# ── Flash single key ──────────────────────────────────────────────────────────
+
+def menu_flash_key(settings: Settings, pkt_type: int, label: str,
+                   default_path: Path, expected_len: int) -> None:
+    current_path = default_path
+    while True:
+        _clear()
+        _header(settings, f"Flash {label}")
+        print(_file_line(label, current_path, expected_len))
+        print()
+
+        choice = _choose(["Start", "Choose file"])
+        if choice == 0:
+            break
+        elif choice == 1:
+            if not current_path.exists():
+                print(red(f"  ✗  File not found: {current_path}"))
+                print(dim("     Use option 2 to select a file."))
+                _pause()
+                continue
+            try:
+                raw = load_key(str(current_path), expected_len)
+            except Exception as exc:
+                print(red(f"  ✗  {exc}"))
+                _pause()
+                continue
+            do_flash([(pkt_type, raw, label)], settings)
+            _pause()
+        elif choice == 2:
+            try:
+                raw_input = input(f"  Path [{current_path}]: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                continue
+            p = Path(raw_input) if raw_input else current_path
+            if not p.exists():
+                print(red(f"  ✗  Not found: {p}"))
+                _pause()
+            else:
+                current_path = p
+
+
+# ── Flash Configuration ───────────────────────────────────────────────────────
+
+def menu_flash_config(settings: Settings) -> None:
+    while True:
+        _clear()
+        _header(settings, "Flash Configuration")
+        _print_config(settings["config"])
+        print()
+
+        choice = _choose(["Start", "Edit values", "Reset to defaults"])
+        if choice == 0:
+            break
+        elif choice == 1:
+            payload = _pack_config(settings["config"])
+            do_flash([(PKT_CONFIG, payload, "Configuration")], settings)
+            _pause()
+        elif choice == 2:
+            menu_edit_config(settings)
+        elif choice == 3:
+            settings["config"] = _default_config()
+            print(green("  Config reset to defaults."))
+            _pause()
+
+
+def menu_edit_config(settings: Settings) -> None:
+    while True:
+        _clear()
+        _header(settings, "Edit Configuration")
+        cfg = settings["config"]
+        for i, (name, desc, default) in enumerate(CONFIG_FIELDS, 1):
+            val = cfg.get(name, default)
+            print(f"  {i}.  {name:<32}  [{val:>6} ms]  {dim(desc)}")
+        print(f"  {len(CONFIG_FIELDS) + 1}.  Reset to defaults")
+        print(f"  0.  Back")
+        print()
+
+        try:
+            raw = input("  Select: ").strip()
+            idx = int(raw)
+        except (ValueError, KeyboardInterrupt, EOFError):
+            continue
+
+        if idx == 0:
+            break
+        elif 1 <= idx <= len(CONFIG_FIELDS):
+            name, desc, default = CONFIG_FIELDS[idx - 1]
+            current = cfg.get(name, default)
+            try:
+                v = input(f"  {name} [{current}]: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                continue
+            if v:
+                try:
+                    new_val = int(v)
+                    if new_val < 0:
+                        raise ValueError
+                    cfg[name] = new_val
+                    settings["config"] = cfg
+                except ValueError:
+                    print(red("  Invalid — enter a non-negative integer."))
+                    _pause()
+        elif idx == len(CONFIG_FIELDS) + 1:
+            settings["config"] = _default_config()
+            print(green("  Reset to defaults."))
+            _pause()
+
+def _print_config(cfg: Dict[str, int]) -> None:
+    for name, desc, default in CONFIG_FIELDS:
+        val = cfg.get(name, default)
+        print(f"  {name:<32}  {val:>6} ms   {dim(desc)}")
+
+
+# ── Get Configuration ─────────────────────────────────────────────────────────
+
+def menu_get_config(settings: Settings) -> None:
+    while True:
+        _clear()
+        _header(settings, "Get Configuration")
+        print("  Reads the current configuration from device NVRAM.")
+        print()
+
+        choice = _choose(["Start"])
+        if choice == 0:
+            break
+        elif choice == 1:
+            result = do_get_config(settings)
+            if result is not None:
+                print(f"\n  {green('✓')}  Configuration received:\n")
+                _print_config(result)
+                if _ask_yn("Load these values into settings?"):
+                    settings["config"] = result
+                    print(green("  Settings updated."))
+            _pause()
+
+
+# ── Generate Key Pair ─────────────────────────────────────────────────────────
+
+def menu_generate_keys(settings: Settings) -> None:
+    while True:
+        _clear()
+        _header(settings, "Generate Key Pair")
+        out_dir   = settings.key_dir_path()
+        priv_path = out_dir / "private.bin"
+        pub_path  = out_dir / "public.bin"
+        print(f"  Output directory : {out_dir}")
+        print(f"  Private key      : {priv_path}"
+              + (f"  {yellow('[will overwrite]')}" if priv_path.exists() else ""))
+        print(f"  Public key       : {pub_path}"
+              + (f"  {yellow('[will overwrite]')}" if pub_path.exists() else ""))
+        print()
+
+        choice = _choose(["Generate and save", "Change output directory"])
+        if choice == 0:
+            break
+        elif choice == 1:
+            if (priv_path.exists() or pub_path.exists()):
+                if not _ask_yn("Existing key files will be overwritten. Continue?",
+                               default=False):
+                    continue
+            print()
+            try:
+                priv_bytes, pub_bytes = generate_keypair(out_dir)
+                print(green(f"  ✓  {priv_path}  [{len(priv_bytes)} B]"))
+                print(green(f"  ✓  {pub_path}   [{len(pub_bytes)} B]"))
+            except Exception as exc:
+                print(red(f"  ✗  Key generation failed: {exc}"))
+                _pause()
+                continue
+
+            if _ask_yn("Flash to device now?"):
+                packets = [
+                    (PKT_PRIVKEY, priv_bytes, "Private Key"),
+                    (PKT_PUBKEY,  pub_bytes,  "Public Key"),
+                ]
+                do_flash(packets, settings)
+            _pause()
+        elif choice == 2:
+            try:
+                raw = input(f"  Key directory [{settings['key_dir']}]: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                continue
+            if raw:
+                settings["key_dir"] = raw
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+
+def menu_settings(settings: Settings) -> None:
+    while True:
+        _clear()
+        _header(settings, "Settings")
+        print(f"  1.  Serial port      [{settings['port']}]")
+        print(f"  2.  Baud rate        [{settings['baud']}]")
+        print(f"  3.  Max retries      [{settings['max_retries']}]")
+        print(f"  4.  Wait timeout     [{settings['wait_timeout']} s]")
+        print(f"  5.  Key directory    [{settings['key_dir']}]")
+        print(f"  6.  Verbose output   [{'on' if settings['verbose'] else 'off'}]")
+        print(f"  0.  Back")
+        print()
+
+        try:
+            raw = input("  Select: ").strip()
+            idx = int(raw)
+        except (ValueError, KeyboardInterrupt, EOFError):
+            continue
+
+        if idx == 0:
+            break
+        elif idx == 1:
+            _settings_str(settings, "port", "Serial port", "/dev/serial0")
+        elif idx == 2:
+            _settings_int(settings, "baud", "Baud rate", 9600)
+        elif idx == 3:
+            _settings_int(settings, "max_retries", "Max retries", 3)
+        elif idx == 4:
+            _settings_float(settings, "wait_timeout", "Wait timeout (s)", 8.0)
+        elif idx == 5:
+            _settings_str(settings, "key_dir", "Key directory", "keys")
+        elif idx == 6:
+            settings["verbose"] = not settings["verbose"]
+
+def _settings_str(settings: Settings, key: str, label: str, default: str) -> None:
+    try:
+        v = input(f"  {label} [{settings[key]}]: ").strip()
+        if v:
+            settings[key] = v
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+def _settings_int(settings: Settings, key: str, label: str, default: int) -> None:
+    try:
+        v = input(f"  {label} [{settings[key]}]: ").strip()
+        if v:
+            settings[key] = int(v)
+    except (ValueError, KeyboardInterrupt, EOFError):
+        pass
+
+def _settings_float(settings: Settings, key: str, label: str, default: float) -> None:
+    try:
+        v = input(f"  {label} [{settings[key]}]: ").strip()
+        if v:
+            settings[key] = float(v)
+    except (ValueError, KeyboardInterrupt, EOFError):
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Non-interactive CLI  (unchanged behaviour from v1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="fof_prov.py",
+        description="FoF STM32 field provisioning — Raspberry Pi peer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+        Run without action flags to enter the interactive menu.
+
+        examples:
+          python3 fof_prov.py                            # interactive TUI
+          python3 fof_prov.py --generate                 # generate keys, then flash
+          python3 fof_prov.py --private-key priv.bin     # flash one key
+          python3 fof_prov.py --port /dev/ttyAMA0 \\
+              --private-key priv.bin --public-key pub.bin \\
+              --tx-timeout 500 --main-delay 2
+        """),
+    )
+
+    g = ap.add_argument_group("serial port")
+    g.add_argument("--port",  default=None, help="UART device  (default: from settings)")
+    g.add_argument("--baud",  type=int, default=None, help="baud rate (default: 9600)")
+
+    g = ap.add_argument_group("key packets")
+    g.add_argument("--private-key", metavar="FILE")
+    g.add_argument("--public-key",  metavar="FILE")
+    g.add_argument("--generate",    action="store_true",
+                   help="generate a fresh SECP256R1 keypair, save to key-dir, then flash")
+
+    g = ap.add_argument_group("config packet  (sent when any flag is provided)")
+    g.add_argument("--tx-timeout",        type=int, metavar="MS",
+                   help="TxTimeoutMs                (default: 500)")
+    g.add_argument("--transponder-cycle", type=int, metavar="MS",
+                   help="TransponderMainCycleMs      (default: 2)")
+    g.add_argument("--challenger-cycle",  type=int, metavar="MS",
+                   help="ChallengerMainCycleMs       (default: 1000)")
+    g.add_argument("--response-wait",     type=int, metavar="MS",
+                   help="ResponseWaitCycleDelayMs    (default: 10)")
+    g.add_argument("--rtt-tolerance",     type=int, metavar="MS",
+                   help="ResponseDelayToleranceMs    (default: 500)")
+    g.add_argument("--watchdog",          type=int, metavar="MS",
+                   help="WatchdogTimeoutMs           (default: 1000)")
+
+    g = ap.add_argument_group("behaviour")
+    g.add_argument("--max-retries",  type=int, default=None, metavar="N")
+    g.add_argument("--wait",         type=float, default=None, metavar="SECS")
+    g.add_argument("--byte-timeout", type=float, default=None, metavar="SECS")
+    g.add_argument("--dry-run",      action="store_true",
+                   help="build and print packets without opening the serial port")
+    g.add_argument("-v", "--verbose", action="store_true")
+
+    return ap
+
+
+def run_cli(args: argparse.Namespace, settings: Settings) -> int:
+    # Override settings with CLI flags
+    if args.port:         settings["port"]         = args.port
+    if args.baud:         settings["baud"]         = args.baud
+    if args.max_retries:  settings["max_retries"]  = args.max_retries
+    if args.wait:         settings["wait_timeout"] = args.wait
+    if args.byte_timeout: settings["byte_timeout"] = args.byte_timeout
+    if args.verbose:      settings["verbose"]      = True
+
+    packets: List[Tuple[int, bytes, str]] = []
+    errors:  List[str] = []
+
+    # Key generation
+    if args.generate:
+        out_dir = settings.key_dir_path()
+        print(f"Generating SECP256R1 keypair → {out_dir}/")
+        try:
+            priv_bytes, pub_bytes = generate_keypair(out_dir)
+            print(green(f"  ✓  private.bin  [{len(priv_bytes)} B]"))
+            print(green(f"  ✓  public.bin   [{len(pub_bytes)} B]"))
+            packets.append((PKT_PRIVKEY, priv_bytes, "Private Key"))
+            packets.append((PKT_PUBKEY,  pub_bytes,  "Public Key"))
+        except Exception as exc:
+            errors.append(f"--generate: {exc}")
+
+    if args.private_key and not args.generate:
+        try:
+            packets.append((PKT_PRIVKEY, load_key(args.private_key, PRIVKEY_LEN),
+                            "Private Key"))
+        except Exception as exc:
+            errors.append(f"--private-key: {exc}")
+
+    if args.public_key and not args.generate:
+        try:
+            packets.append((PKT_PUBKEY, load_key(args.public_key, PUBKEY_LEN),
+                            "Public Key"))
+        except Exception as exc:
+            errors.append(f"--public-key: {exc}")
+
+    # Config
+    cfg_flags = {
+        "TxTimeoutMs":              args.tx_timeout,
+        "TransponderMainCycleMs":   args.transponder_cycle,
+        "ChallengerMainCycleMs":    args.challenger_cycle,
+        "ResponseWaitCycleDelayMs": args.response_wait,
+        "ResponseDelayToleranceMs": args.rtt_tolerance,
+        "WatchdogTimeoutMs":        args.watchdog,
+    }
+    if any(v is not None for v in cfg_flags.values()):
+        cfg = dict(settings["config"])
+        for k, v in cfg_flags.items():
+            if v is not None:
+                cfg[k] = v
+        payload = _pack_config(cfg)
+        vals    = struct.unpack("<6I", payload)
+        label   = ("Configuration\n"
+                   + "\n".join(f"   {n}={v}"
+                               for (n, _, _), v in zip(CONFIG_FIELDS, vals)))
+        packets.append((PKT_CONFIG, payload, label))
+
+    if errors:
+        for e in errors:
+            print(red(f"Error: {e}"))
+        return 1
+
+    if not packets:
+        print(yellow("Nothing to send.  Run without flags for interactive mode."))
+        make_parser().print_usage()
+        return 1
+
+    print(bold(f"\nFoF provisioning — {len(packets)} packet(s):"))
+    for _, payload, label in packets:
+        print(f"  • {label.splitlines()[0]}  ({len(payload)} B)")
+
+    if args.dry_run:
+        print(yellow("\n[DRY RUN] packets not transmitted."))
+        if args.verbose:
+            for pkt_type, payload, label in packets:
+                pkt = build_packet(pkt_type, payload)
+                _hex_dump(label.splitlines()[0], pkt)
+        return 0
+
+    success = do_flash(packets, settings)
     return 0 if success else 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    settings = Settings()
+    ap       = make_parser()
+    args     = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(message)s")
+
+    # Determine mode: interactive if no action flags supplied
+    action_flags = [
+        args.private_key, args.public_key,
+        args.tx_timeout, args.transponder_cycle, args.challenger_cycle,
+        args.response_wait, args.rtt_tolerance, args.watchdog,
+    ]
+    is_interactive = (
+        not args.generate
+        and all(f is None for f in action_flags)
+    )
+
+    if is_interactive:
+        try:
+            menu_main(settings)
+        except (KeyboardInterrupt, EOFError):
+            print()
+        return 0
+
+    return run_cli(args, settings)
 
 
 if __name__ == "__main__":

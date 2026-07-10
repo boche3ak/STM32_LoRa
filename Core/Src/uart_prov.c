@@ -25,7 +25,7 @@
 #define NVRAM_SIZE         1024u
 #define NVRAM_PRIVKEY_OFF  4u    /* 32 bytes after 4-byte magic */
 #define NVRAM_PUBKEY_OFF   36u   /* 64 bytes                     */
-#define NVRAM_CONFIG_OFF   100u  /* 16 bytes = 4 × uint32_t      */
+#define NVRAM_CONFIG_OFF   100u  /* 24 bytes = 6 × uint32_t      */
 
 /* ============================================================================
  * Timing
@@ -190,7 +190,16 @@ static bool recv_packet_body(Packet *pkt, uint8_t frame_buf[/* 3+64 */])
         case PROV_TYPE_PRIVKEY: expected_len = PROV_PRIVKEY_LEN; break;
         case PROV_TYPE_PUBKEY:  expected_len = PROV_PUBKEY_LEN;  break;
         case PROV_TYPE_CONFIG:  expected_len = PROV_CONFIG_LEN;  break;
-        default: return false;
+        case PROV_GET_CONFIG:   expected_len = 0u;               break;
+        default:
+            /* Unknown type: drain payload + CRC to keep framing intact, then reject. */
+            for (uint8_t i = 0u; i < len; i++) {
+                uint8_t dummy;
+                if (!uart_recv_byte(&dummy, BYTE_TIMEOUT_MS)) return false;
+            }
+            { uint8_t d; uart_recv_byte(&d, BYTE_TIMEOUT_MS); uart_recv_byte(&d, BYTE_TIMEOUT_MS); }
+            uart_send(PROV_RJCT);
+            return false;
     }
     if (len != expected_len) return false;
 
@@ -323,24 +332,28 @@ UartProvResult uart_prov_run(void)
         bool pkt_ok = recv_packet_body(&pkt, frame_buf);
 
         if (pkt_ok) {
-            uart_send(PROV_ACK);   /* ACK = accepted + ready for next */
-
-            switch (pkt.type) {
-                case PROV_TYPE_PRIVKEY:
-                    memcpy(nvram_shadow + NVRAM_PRIVKEY_OFF, pkt.payload, PROV_PRIVKEY_LEN);
-                    break;
-                case PROV_TYPE_PUBKEY:
-                    memcpy(nvram_shadow + NVRAM_PUBKEY_OFF,  pkt.payload, PROV_PUBKEY_LEN);
-                    break;
-                case PROV_TYPE_CONFIG:
-                    memcpy(nvram_shadow + NVRAM_CONFIG_OFF,  pkt.payload, PROV_CONFIG_LEN);
-                    break;
-                default:
-                    break;
+            if (pkt.type == PROV_GET_CONFIG) {
+                /* Read-back not yet implemented on this device. */
+                uart_send(PROV_RJCT);
+            } else {
+                uart_send(PROV_ACK);   /* ACK = accepted + ready for next */
+                switch (pkt.type) {
+                    case PROV_TYPE_PRIVKEY:
+                        memcpy(nvram_shadow + NVRAM_PRIVKEY_OFF, pkt.payload, PROV_PRIVKEY_LEN);
+                        break;
+                    case PROV_TYPE_PUBKEY:
+                        memcpy(nvram_shadow + NVRAM_PUBKEY_OFF,  pkt.payload, PROV_PUBKEY_LEN);
+                        break;
+                    case PROV_TYPE_CONFIG:
+                        memcpy(nvram_shadow + NVRAM_CONFIG_OFF,  pkt.payload, PROV_CONFIG_LEN);
+                        break;
+                    default:
+                        break;
+                }
+                any_stored = true;
             }
-            any_stored = true;
         } else {
-            uart_send(PROV_NAK);   /* NAK = error, please retransmit */
+            uart_send(PROV_NAK);   /* NAK = CRC error, please retransmit */
         }
 
         IWDG->KR = 0xAAAAu;

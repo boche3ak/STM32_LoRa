@@ -32,16 +32,24 @@
   * Packet types and payload sizes:
   *   PROV_TYPE_PRIVKEY  0xB1  32 bytes  — SECP256R1 private key scalar
   *   PROV_TYPE_PUBKEY   0xB2  64 bytes  — SECP256R1 public key (x||y uncompressed)
-  *   PROV_TYPE_CONFIG   0xB3  16 bytes  — 4 × uint32_t little-endian:
+  *   PROV_TYPE_CONFIG   0xB3  24 bytes  — 6 × uint32_t little-endian:
   *                                         [0] TxTimeoutMs
-  *                                         [1] MainCycleDelayUs
-  *                                         [2] ResponseDelayToleranceMs
-  *                                         [3] WatchdogTimeoutMs
+  *                                         [1] TransponderMainCycleMs
+  *                                         [2] ChallengerMainCycleMs
+  *                                         [3] ResponseWaitCycleDelayMs
+  *                                         [4] ResponseDelayToleranceMs
+  *                                         [5] WatchdogTimeoutMs
+  *   PROV_GET_CONFIG    0xB4   0 bytes  — query: read back current config
+  *                                         device replies PROV_RJCT (0xFF) if unsupported
+  *
+  * Control byte (device → counterpart, response to unsupported request):
+  *   PROV_RJCT   0xFF  — request not supported by this device firmware
   *
   * Packet sizes (total bytes on wire):
-  *   Private key : 1+1+1+32+2 = 37 bytes  (~38 ms @ 9600 baud)
-  *   Public key  : 1+1+1+64+2 = 69 bytes  (~72 ms @ 9600 baud)
-  *   Config      : 1+1+1+16+2 = 21 bytes  (~22 ms @ 9600 baud)
+  *   Private key  : 1+1+1+32+2 = 37 bytes  (~38 ms @ 9600 baud)
+  *   Public key   : 1+1+1+64+2 = 69 bytes  (~72 ms @ 9600 baud)
+  *   Config write : 1+1+1+24+2 = 29 bytes  (~30 ms @ 9600 baud)
+  *   Get config   : 1+1+1+ 0+2 =  5 bytes  (< 1 ms @ 9600 baud)
   *
   * Session flow:
   *   Device                          Counterpart
@@ -55,9 +63,10 @@
   *     |--- PROV_ACK (0x06) --------->|
   *     |  [write flash NVRAM]         |
   *
-  *   Counterpart may send any subset of the three packets in any order.
-  *   The device sends PROV_READY only once; after that each ACK/NAK acts as
-  *   the implicit "ready" signal for the counterpart.
+  *   Counterpart may send any subset of the three write packets in any order,
+  *   optionally including a PROV_GET_CONFIG query. The device sends PROV_READY
+  *   only once; after that each ACK/NAK/RJCT acts as the implicit "ready"
+  *   signal for the counterpart.
   *
   * LED feedback (PA2 — STAT_FRIEND_FOF):
   *   Searching for counterpart : 250 ms on / 250 ms off  (slow blink)
@@ -79,17 +88,19 @@ extern "C" {
 #define PROV_ACK            0x06u
 #define PROV_NAK            0x15u
 #define PROV_EOT            0x04u
+#define PROV_RJCT           0xFFu // this requiest is not supported
 
 /* Packet frame constants */
 #define PROV_SOF            0x55u
 #define PROV_TYPE_PRIVKEY   0xB1u
 #define PROV_TYPE_PUBKEY    0xB2u
 #define PROV_TYPE_CONFIG    0xB3u
+#define PROV_GET_CONFIG     0xB4u
 
 /* Payload lengths (bytes) */
 #define PROV_PRIVKEY_LEN    32u
 #define PROV_PUBKEY_LEN     64u
-#define PROV_CONFIG_LEN     16u   /* 4 × uint32_t */
+#define PROV_CONFIG_LEN     24u   /* 6 × uint32_t */
 
 typedef enum {
     UART_PROV_NO_COUNTERPART = 0, /* no counterpart detected — normal cold start */
