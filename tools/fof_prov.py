@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 fof_prov.py — FoF STM32 Field Provisioning Tool
+author: Oleksandr Kotenkov
+email: ok@aleko-embedded.com
 
 Interactive TUI (and non-interactive CLI) for provisioning the STM32 LoRa
 device via USART1: send private key, public key, configuration data, and
@@ -60,7 +62,9 @@ PROV_SOF         = 0x55   # packet start-of-frame byte
 PKT_PRIVKEY      = 0xB1   # SECP256R1 private key scalar   (32 B)
 PKT_PUBKEY       = 0xB2   # SECP256R1 public key  x‖y     (64 B)
 PKT_CONFIG       = 0xB3   # runtime config  6 × uint32_t   (24 B)
-PKT_GET_CONFIG   = 0xB4   # query: read back device config  (0 B payload)
+PKT_GET_CONFIG   = 0xB4   # query: read back device config   (0 B payload)
+PKT_GET_PRIVKEY  = 0xB5   # query: read back stored privkey  (0 B payload)
+PKT_GET_PUBKEY   = 0xB6   # query: read back stored pubkey   (0 B payload)
 
 PRIVKEY_LEN = 32
 PUBKEY_LEN  = 64
@@ -571,6 +575,55 @@ class ProvSession:
         self._log(red(f"GET_CONFIG failed after {self.max_retries} attempts."))
         return None
 
+    def get_key(self, query_type: int, resp_type: int,
+                expected_len: int, label: str) -> Optional[bytes]:
+        """Send a GET_PRIVKEY / GET_PUBKEY query; return raw key bytes or None."""
+        packet = build_packet(query_type, b"")
+        print(f"\n  {bold('▸  GET_' + label.upper().replace(' ', '_') + ' request')}")
+        if self.verbose:
+            _hex_dump("Packet", packet)
+
+        for attempt in range(1, self.max_retries + 1):
+            if attempt > 1:
+                self._log(yellow(f"Retry {attempt}/{self.max_retries}…"))
+
+            self._conn.send(packet, flush_rx=True)
+
+            resp = None
+            for _ in range(4):
+                resp = self._recv(timeout=self.byte_timeout)
+                if resp is None:
+                    self._log(yellow(f"No response (attempt {attempt})"))
+                    break
+                if resp in (PROV_RJCT, PROV_NAK):
+                    print(f"\n  {red('✗')}  "
+                          f"Device doesn't support reading out the {label}.")
+                    return None
+                if resp == PROV_SOF:
+                    break
+                self._log(yellow(f"Skipping stale byte 0x{resp:02X}"))
+
+            if resp != PROV_SOF:
+                continue
+
+            result = self._recv_packet_from_sof()
+            if result is None:
+                self._log(yellow(f"Incomplete response (attempt {attempt})"))
+                continue
+            pkt_type, payload = result
+            if pkt_type != resp_type or len(payload) != expected_len:
+                self._log(yellow(
+                    f"Unexpected response type=0x{pkt_type:02X} len={len(payload)}"
+                    f" (attempt {attempt})"))
+                continue
+
+            self._log(green(f"{label} received  ✓"))
+            return bytes(payload)
+
+        self._log(red(f"GET_{label.upper().replace(' ', '_')} failed after "
+                      f"{self.max_retries} attempts."))
+        return None
+
     # ── Summary ───────────────────────────────────────────────────────────────
 
     def print_summary(self, success: bool) -> None:
@@ -666,6 +719,13 @@ def do_get_config(settings: Settings) -> Optional[Dict[str, int]]:
         return None
     return _gs.prov.get_config()
 
+def do_get_key(query_type: int, resp_type: int,
+               expected_len: int, label: str,
+               settings: Settings) -> Optional[bytes]:
+    if not ensure_connected(settings):
+        return None
+    return _gs.prov.get_key(query_type, resp_type, expected_len, label)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TUI helpers
@@ -730,22 +790,13 @@ def _file_line(label: str, path: Path, expected_size: int) -> str:
     return f"  {icon}  {label:<16} {str(path):<36} [{detail}]"
 
 
-def _show_key_file(path: Path, expected_len: int) -> None:
-    if not path.exists():
-        print(red(f"\n  ✗  File not found: {path}"))
-        return
-    try:
-        raw = load_key(str(path), expected_len)
-    except Exception as exc:
-        print(red(f"\n  ✗  {exc}"))
-        return
-    print(f"\n  File  : {path}  [{len(raw)} B]")
+def _show_key_bytes(raw: bytes, expected_len: int) -> None:
     if expected_len == PRIVKEY_LEN:
-        print(f"  Key   : {raw[:4].hex()} … {raw[-4:].hex()}"
+        print(f"  Key  : {raw[:4].hex()} … {raw[-4:].hex()}"
               f"  {dim('(first / last 4 bytes shown)')}")
     else:
-        print(f"  X     : {raw[:32].hex()}")
-        print(f"  Y     : {raw[32:].hex()}")
+        print(f"  X    : {raw[:32].hex()}")
+        print(f"  Y    : {raw[32:].hex()}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -840,6 +891,11 @@ def _collect_key_packets(settings: Settings) -> List[Tuple[int, bytes, str]]:
 
 # ── Key sub-menu (Read / Write / Choose file) ─────────────────────────────────
 
+_GET_KEY_CMD = {
+    PKT_PRIVKEY: (PKT_GET_PRIVKEY, PKT_PRIVKEY),
+    PKT_PUBKEY:  (PKT_GET_PUBKEY,  PKT_PUBKEY),
+}
+
 def menu_key(settings: Settings, pkt_type: int, label: str,
              default_path: Path, expected_len: int) -> None:
     current_path = default_path
@@ -852,8 +908,15 @@ def menu_key(settings: Settings, pkt_type: int, label: str,
         choice = _choose(["Read", "Write", "Choose file"])
         if choice == 0:
             break
-        elif choice == 1:  # Read — display file content
-            _show_key_file(current_path, expected_len)
+        elif choice == 1:  # Read from device; auto-save if file missing
+            query_type, resp_type = _GET_KEY_CMD[pkt_type]
+            raw = do_get_key(query_type, resp_type, expected_len, label, settings)
+            if raw is not None:
+                _show_key_bytes(raw, expected_len)
+                if not current_path.exists():
+                    current_path.parent.mkdir(parents=True, exist_ok=True)
+                    current_path.write_bytes(raw)
+                    print(green(f"\n  ✓  Saved to {current_path}"))
             _pause()
         elif choice == 2:  # Write — flash file to device
             if not current_path.exists():
@@ -893,11 +956,14 @@ def menu_config(settings: Settings) -> None:
         elif choice == 1:  # Read from device
             result = do_get_config(settings)
             if result is not None:
-                print(f"\n  {green('✓')}  Configuration received:\n")
+                print(f"\n  {green('✓')}  Configuration received from device:\n")
                 _print_config(result)
                 if _ask_yn("Load these values into local settings?"):
                     settings["config"] = result
                     print(green("  Settings updated."))
+            else:
+                print(f"\n  {yellow('!')}  Device not reachable — showing local settings:\n")
+                _print_config(settings["config"])
             _pause()
         elif choice == 2:  # Write to device
             do_flash([(PKT_CONFIG, _pack_config(settings["config"]), "Configuration")],

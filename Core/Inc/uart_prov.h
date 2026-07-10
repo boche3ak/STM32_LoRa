@@ -41,6 +41,10 @@
   *                                         [5] WatchdogTimeoutMs
   *   PROV_GET_CONFIG    0xB4   0 bytes  — query: read back current NVRAM config
   *                                         device replies with a PROV_TYPE_CONFIG packet
+  *   PROV_GET_PRIVKEY   0xB5   0 bytes  — query: read back stored private key
+  *                                         device replies with a PROV_TYPE_PRIVKEY packet
+  *   PROV_GET_PUBKEY    0xB6   0 bytes  — query: read back stored public key
+  *                                         device replies with a PROV_TYPE_PUBKEY packet
   *
   * Control byte (device → counterpart, response to unsupported request):
   *   PROV_RJCT   0xFF  — request not supported by this device firmware
@@ -50,6 +54,8 @@
   *   Public key   : 1+1+1+64+2 = 69 bytes  (~72 ms @ 9600 baud)
   *   Config write : 1+1+1+24+2 = 29 bytes  (~30 ms @ 9600 baud)
   *   Get config   : 1+1+1+ 0+2 =  5 bytes  (< 1 ms @ 9600 baud)
+  *   Get privkey  : 1+1+1+ 0+2 =  5 bytes  (< 1 ms @ 9600 baud)
+  *   Get pubkey   : 1+1+1+ 0+2 =  5 bytes  (< 1 ms @ 9600 baud)
   *
   * Session flow:
   *   Device                          Counterpart
@@ -100,6 +106,8 @@ extern "C" {
 #define PROV_TYPE_PUBKEY    0xB2u
 #define PROV_TYPE_CONFIG    0xB3u
 #define PROV_GET_CONFIG     0xB4u
+#define PROV_GET_PRIVKEY    0xB5u
+#define PROV_GET_PUBKEY     0xB6u
 
 /* Payload lengths (bytes) */
 #define PROV_PRIVKEY_LEN    32u

@@ -188,10 +188,12 @@ static bool recv_packet_body(Packet *pkt, uint8_t frame_buf[/* 3+64 */])
 
     uint8_t expected_len;
     switch (type) {
-        case PROV_TYPE_PRIVKEY: expected_len = PROV_PRIVKEY_LEN; break;
-        case PROV_TYPE_PUBKEY:  expected_len = PROV_PUBKEY_LEN;  break;
-        case PROV_TYPE_CONFIG:  expected_len = PROV_CONFIG_LEN;  break;
-        case PROV_GET_CONFIG:   expected_len = 0u;               break;
+        case PROV_TYPE_PRIVKEY:  expected_len = PROV_PRIVKEY_LEN; break;
+        case PROV_TYPE_PUBKEY:   expected_len = PROV_PUBKEY_LEN;  break;
+        case PROV_TYPE_CONFIG:   expected_len = PROV_CONFIG_LEN;  break;
+        case PROV_GET_CONFIG:    expected_len = 0u;               break;
+        case PROV_GET_PRIVKEY:   expected_len = 0u;               break;
+        case PROV_GET_PUBKEY:    expected_len = 0u;               break;
         default:
             /* Unknown type: drain payload + CRC to keep framing intact, then reject. */
             for (uint8_t i = 0u; i < len; i++) {
@@ -350,23 +352,45 @@ UartProvResult uart_prov_run(void)
         bool pkt_ok = recv_packet_body(&pkt, frame_buf);
 
         if (pkt_ok) {
-            if (pkt.type == PROV_GET_CONFIG) {
+            if (   pkt.type == PROV_GET_CONFIG
+                || pkt.type == PROV_GET_PRIVKEY
+                || pkt.type == PROV_GET_PUBKEY) {
                 /*
-                 * Send the config from nvram_shadow, not from flash.
-                 * nvram_shadow is seeded from flash at session start and patched
-                 * in-place by any PROV_TYPE_CONFIG write during this session.
-                 * Reading flash here would return stale values whenever a write
-                 * has been received but EOT (flash commit) not yet sent.
+                 * Read-back queries.  All three commands share the same response
+                 * frame shape (SOF | TYPE | LEN | PAYLOAD | CRC16).  Data is read
+                 * from nvram_shadow, not from flash, so that any pending writes
+                 * received earlier in this session are reflected immediately.
                  */
-                uint8_t resp[3u + PROV_CONFIG_LEN];
+                uint8_t  resp_type;
+                uint8_t  resp_len;
+                uint16_t resp_off;
+
+                switch (pkt.type) {
+                    case PROV_GET_PRIVKEY:
+                        resp_type = PROV_TYPE_PRIVKEY;
+                        resp_len  = PROV_PRIVKEY_LEN;
+                        resp_off  = NVRAM_PRIVKEY_OFF;
+                        break;
+                    case PROV_GET_PUBKEY:
+                        resp_type = PROV_TYPE_PUBKEY;
+                        resp_len  = PROV_PUBKEY_LEN;
+                        resp_off  = NVRAM_PUBKEY_OFF;
+                        break;
+                    default: /* PROV_GET_CONFIG */
+                        resp_type = PROV_TYPE_CONFIG;
+                        resp_len  = PROV_CONFIG_LEN;
+                        resp_off  = NVRAM_CONFIG_OFF;
+                        break;
+                }
+
+                /* Largest response is public key (64 B): frame = 3 + 64 = 67 B */
+                uint8_t resp[3u + PROV_PUBKEY_LEN];
                 resp[0u] = PROV_SOF;
-                resp[1u] = PROV_TYPE_CONFIG;
-                resp[2u] = PROV_CONFIG_LEN;
-                memcpy(&resp[3u],
-                       nvram_shadow + NVRAM_CONFIG_OFF,
-                       PROV_CONFIG_LEN);
-                uint16_t resp_crc = crc16_ccitt(resp, (uint16_t)(3u + PROV_CONFIG_LEN));
-                for (uint8_t i = 0u; i < (uint8_t)sizeof(resp); i++) uart_send(resp[i]);
+                resp[1u] = resp_type;
+                resp[2u] = resp_len;
+                memcpy(&resp[3u], nvram_shadow + resp_off, resp_len);
+                uint16_t resp_crc = crc16_ccitt(resp, (uint16_t)(3u + resp_len));
+                for (uint8_t i = 0u; i < (uint8_t)(3u + resp_len); i++) uart_send(resp[i]);
                 uart_send((uint8_t)(resp_crc >> 8u));
                 uart_send((uint8_t)(resp_crc & 0xFFu));
             } else {
