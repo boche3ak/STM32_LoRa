@@ -54,19 +54,22 @@
   * Session flow:
   *   Device                          Counterpart
   *     |--- PROV_READY (0xAA) ------->|
+  *     |<-- PROV_PING (0x05)  --------|  keepalive (ignored, resets idle timer)
   *     |<-- SOF|TYPE|LEN|PAYLOAD|CRC -|  (packet N)
   *     |  [verify CRC]                |
   *     |--- PROV_ACK (0x06) --------->|  OK  → store; counterpart sends next
   *     |--- PROV_NAK (0x15) --------->|  bad → counterpart retransmits (max 3×)
+  *     |<-- PROV_PING …               |  keepalive during operator menu navigation
   *     |      ...                     |
-  *     |<-- PROV_EOT (0x04) ----------|  no more packets
+  *     |<-- PROV_EOT (0x04) ----------|  end of session (commits flash write)
   *     |--- PROV_ACK (0x06) --------->|
   *     |  [write flash NVRAM]         |
   *
-  *   Counterpart may send any subset of the three write packets in any order,
-  *   optionally including a PROV_GET_CONFIG query. The device sends PROV_READY
-  *   only once; after that each ACK/NAK/RJCT acts as the implicit "ready"
-  *   signal for the counterpart.
+  *   Counterpart may send any subset of the write packets in any order,
+  *   optionally preceded by a PROV_GET_CONFIG query.  PROV_PING bytes sent
+  *   between packets keep the device in the session loop
+  *   (SESSION_IDLE_TIMEOUT_MS = 5000 ms >> 1 s ping interval).  Flash is
+  *   written atomically only when PROV_EOT is received.
   *
   * LED feedback (PA2 — STAT_FRIEND_FOF):
   *   Searching for counterpart : 250 ms on / 250 ms off  (slow blink)
@@ -87,8 +90,9 @@ extern "C" {
 #define PROV_READY          0xAAu
 #define PROV_ACK            0x06u
 #define PROV_NAK            0x15u
-#define PROV_EOT            0x04u
-#define PROV_RJCT           0xFFu // this requiest is not supported
+#define PROV_EOT            0x04u   /* end of transmission — commits flash write  */
+#define PROV_PING           0x05u   /* keepalive from counterpart (ASCII ENQ); ignored by packet loop */
+#define PROV_RJCT           0xFFu   /* request not supported by this firmware     */
 
 /* Packet frame constants */
 #define PROV_SOF            0x55u

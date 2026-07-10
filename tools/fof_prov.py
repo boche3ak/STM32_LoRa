@@ -4,7 +4,14 @@ fof_prov.py — FoF STM32 Field Provisioning Tool
 
 Interactive TUI (and non-interactive CLI) for provisioning the STM32 LoRa
 device via USART1: send private key, public key, configuration data, and
-optionally read back the current configuration.
+read back the current configuration.
+
+Persistent-session model
+────────────────────────
+The UART connection stays open across all menu operations.  A background
+thread sends PROV_PING (0x05) every second so the device does not time out
+between individual operations.  EOT (and the resulting flash commit) is sent
+only when the user disconnects or exits.
 
 Hardware connections (Raspberry Pi  →  STM32 Blue Pill):
   GPIO14 / pin 8  (UART TX)  →  PA10  (USART1_RX)
@@ -18,13 +25,7 @@ Enable UART on the Pi:
 
 Dependencies:
   pip3 install pyserial
-  pip3 install cryptography   # optional — required only for PEM key files
-                              # also required for key generation (--generate)
-
-Supported key-file formats (for --private-key / --public-key):
-  raw binary  — 32 B (private) or 64 B (public)
-  hex text    — 64 or 128 hex chars in a text file (colons/spaces ignored)
-  PEM         — requires 'cryptography' package
+  pip3 install cryptography   # optional — PEM key files and key generation
 """
 
 import sys
@@ -36,6 +37,7 @@ import struct
 import textwrap
 import argparse
 import logging
+import threading
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
 
@@ -47,11 +49,12 @@ except ImportError:
 
 # ── Protocol constants ────────────────────────────────────────────────────────
 
-PROV_READY   = 0xAA   # device  → peer  : ready for next packet
-PROV_ACK     = 0x06   # device  → peer  : packet accepted
-PROV_NAK     = 0x15   # device  → peer  : CRC error — retransmit
-PROV_RJCT    = 0xFF   # device  → peer  : request not supported
-PROV_EOT     = 0x04   # peer    → device: end of transmission
+PROV_READY   = 0xAA   # device → peer : ready for next packet
+PROV_ACK     = 0x06   # device → peer : packet accepted
+PROV_NAK     = 0x15   # device → peer : CRC error — retransmit
+PROV_RJCT    = 0xFF   # device → peer : request not supported
+PROV_EOT     = 0x04   # peer → device : end of transmission (commits flash)
+PROV_PING    = 0x05   # peer → device : keepalive (ignored by device packet loop)
 
 PROV_SOF         = 0x55   # packet start-of-frame byte
 PKT_PRIVKEY      = 0xB1   # SECP256R1 private key scalar   (32 B)
@@ -67,12 +70,12 @@ CONFIG_LEN  = 24    # 6 × uint32_t
 # ── Config field definitions (order matches NVRAM layout) ────────────────────
 
 CONFIG_FIELDS: List[Tuple[str, str, int]] = [
-    ("TxTimeoutMs",              "LoRa transmit timeout",                 500),
-    ("TransponderMainCycleMs",   "Transponder poll rate",                   2),
-    ("ChallengerMainCycleMs",    "Challenger poll rate",                 1000),
-    ("ResponseWaitCycleDelayMs", "Challenger wait per cycle for response",  10),
-    ("ResponseDelayToleranceMs", "Max acceptable challenge-response RTT",  500),
-    ("WatchdogTimeoutMs",        "Watchdog timeout",                      1000),
+    ("TxTimeoutMs",              "LoRa transmit timeout",                  500),
+    ("TransponderMainCycleMs",   "Transponder poll rate",                    2),
+    ("ChallengerMainCycleMs",    "Challenger poll rate",                  1000),
+    ("ResponseWaitCycleDelayMs", "Challenger wait per cycle for response",   10),
+    ("ResponseDelayToleranceMs", "Max acceptable challenge-response RTT",   500),
+    ("WatchdogTimeoutMs",        "Watchdog timeout",                       1000),
 ]
 
 def _default_config() -> Dict[str, int]:
@@ -82,8 +85,7 @@ def _pack_config(cfg: Dict[str, int]) -> bytes:
     return struct.pack("<6I", *[cfg.get(f[0], f[2]) for f in CONFIG_FIELDS])
 
 def _unpack_config(data: bytes) -> Dict[str, int]:
-    vals = struct.unpack("<6I", data)
-    return {f[0]: v for f, v in zip(CONFIG_FIELDS, vals)}
+    return {f[0]: v for f, v in zip(CONFIG_FIELDS, struct.unpack("<6I", data))}
 
 
 # ── ANSI colour helpers ───────────────────────────────────────────────────────
@@ -104,7 +106,6 @@ def dim(s: str)    -> str: return _c("2",  s)
 # ── CRC-16/CCITT ─────────────────────────────────────────────────────────────
 
 def crc16_ccitt(data: bytes) -> int:
-    """poly 0x1021, init 0xFFFF, no reflection — matches device implementation."""
     crc = 0xFFFF
     for b in data:
         crc ^= b << 8
@@ -116,20 +117,17 @@ def crc16_ccitt(data: bytes) -> int:
 # ── Packet construction / parsing ─────────────────────────────────────────────
 
 def build_packet(pkt_type: int, payload: bytes) -> bytes:
-    """SOF | TYPE | LEN | PAYLOAD | CRC_HI | CRC_LO"""
     frame = bytes([PROV_SOF, pkt_type, len(payload)]) + payload
     crc   = crc16_ccitt(frame)
     return frame + bytes([crc >> 8, crc & 0xFF])
 
 def parse_packet(raw: bytes) -> Optional[Tuple[int, bytes]]:
-    """Parse a complete received packet. Returns (type, payload) or None."""
     if len(raw) < 5 or raw[0] != PROV_SOF:
         return None
     pkt_len = raw[2]
     if len(raw) != 3 + pkt_len + 2:
         return None
-    rx_crc = (raw[-2] << 8) | raw[-1]
-    if rx_crc != crc16_ccitt(raw[:-2]):
+    if ((raw[-2] << 8) | raw[-1]) != crc16_ccitt(raw[:-2]):
         return None
     return raw[1], bytes(raw[3:3 + pkt_len])
 
@@ -198,8 +196,7 @@ def generate_keypair(out_dir: Path) -> Tuple[bytes, bytes]:
     pub_nums  = priv_key.public_key().public_numbers()
 
     priv_bytes = priv_nums.private_value.to_bytes(32, "big")
-    pub_bytes  = (pub_nums.x.to_bytes(32, "big") + pub_nums.y.to_bytes(32, "big"))
-
+    pub_bytes  = pub_nums.x.to_bytes(32, "big") + pub_nums.y.to_bytes(32, "big")
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "private.bin").write_bytes(priv_bytes)
     (out_dir / "public.bin").write_bytes(pub_bytes)
@@ -230,9 +227,9 @@ class Settings:
                 # Deep-merge: top-level keys
                 self._data.update(loaded)
                 # Deep-merge: config sub-dict
-                merged_cfg = copy.deepcopy(self._DEFAULTS["config"])
-                merged_cfg.update(loaded.get("config", {}))
-                self._data["config"] = merged_cfg
+                merged = copy.deepcopy(self._DEFAULTS["config"])
+                merged.update(loaded.get("config", {}))
+                self._data["config"] = merged
         except Exception:
             pass
 
@@ -241,9 +238,6 @@ class Settings:
 
     def __setitem__(self, key: str, value: Any) -> None:
         self._data[key] = value
-        self._save()
-
-    def _save(self) -> None:
         try:
             _CFG_FILE.write_text(json.dumps(self._data, indent=2))
         except Exception:
@@ -259,33 +253,108 @@ class Settings:
         return Path(self["key_dir"])
 
 
+# ── Active session (persistent UART connection + keepalive) ───────────────────
+
+class ActiveSession:
+    """
+    Persistent UART connection with background keepalive.
+
+    After READY is received, call start_ping().  A daemon thread then sends
+    PROV_PING (0x05) every second through a write lock so ping bytes cannot
+    interleave with packet data.  EOT (flash commit) is sent on close().
+    """
+
+    def __init__(self, ser: serial.Serial) -> None:
+        self.ser      = ser
+        self._lock    = threading.Lock()
+        self._stop    = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start_ping(self) -> None:
+        self._thread = threading.Thread(target=self._ping_loop, daemon=True)
+        self._thread.start()
+
+    def _ping_loop(self) -> None:
+        while not self._stop.wait(1.0):
+            with self._lock:
+                try:
+                    self.ser.write(bytes([PROV_PING]))
+                    self.ser.flush()
+                except Exception:
+                    break
+
+    def send(self, data: bytes) -> None:
+        """Write bytes exclusively — ping is blocked for the duration."""
+        with self._lock:
+            self.ser.write(data)
+            self.ser.flush()
+
+    def recv(self, timeout: float) -> Optional[int]:
+        """Read one byte with timeout.  No lock needed (opposite direction)."""
+        self.ser.timeout = timeout
+        b = self.ser.read(1)
+        return b[0] if b else None
+
+    def close(self, commit: bool = True) -> None:
+        """Stop pings, optionally send EOT (commits flash), close port."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        if commit:
+            try:
+                with self._lock:
+                    self.ser.write(bytes([PROV_EOT]))
+                    self.ser.flush()
+                self.ser.timeout = 3.0
+                self.ser.read(1)   # consume ACK
+            except Exception:
+                pass
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+
+
+# ── Global session state ──────────────────────────────────────────────────────
+
+class _State:
+    conn: Optional[ActiveSession] = None
+    prov: Optional["ProvSession"] = None
+
+_gs = _State()
+
+
 # ── Provisioning session ──────────────────────────────────────────────────────
 
 class ProvSession:
-    def __init__(self, port: serial.Serial, *,
+    """Protocol operations over an ActiveSession."""
+
+    def __init__(self, conn: ActiveSession, *,
                  max_retries: int = 3,
                  byte_timeout: float = 5.0,
-                 verbose: bool = False):
-        self.port         = port
+                 verbose: bool = False) -> None:
+        self._conn        = conn
         self.max_retries  = max_retries
         self.byte_timeout = byte_timeout
         self.verbose      = verbose
         self._sent  = 0
         self._acked = 0
 
+    def reset_counters(self) -> None:
+        self._sent = self._acked = 0
+
     def _log(self, msg: str) -> None:
-        ts = time.strftime("%H:%M:%S")
-        print(f"  [{ts}]  {msg}")
+        print(f"  [{time.strftime('%H:%M:%S')}]  {msg}")
 
     def _recv(self, timeout: float) -> Optional[int]:
-        self.port.timeout = timeout
-        b = self.port.read(1)
-        return b[0] if b else None
+        return self._conn.recv(timeout)
 
-    # ── Phase 1 ───────────────────────────────────────────────────────────────
+    # ── Wait for READY ────────────────────────────────────────────────────────
 
-    def wait_for_ready(self, timeout: float = 8.0) -> bool:
+    def wait_for_ready(self, timeout: float = 30.0) -> bool:
         print(f"\n  {cyan('Waiting for device READY…')}")
+        print(f"  Port {self._conn.ser.name}  │  {self._conn.ser.baudrate} baud  │  8N1")
+        print(f"  (power on or reset the device within {timeout:.0f} s)\n")
         deadline = time.monotonic() + timeout
         dots = 0
         while time.monotonic() < deadline:
@@ -296,13 +365,14 @@ class ProvSession:
                 continue
             if b == PROV_READY:
                 print()
-                self._log(green(f"READY  (0x{b:02X})"))
+                self._log(green("READY  (0x{:02X})".format(b)))
                 return True
+            logging.debug("ignored 0x%02X waiting for READY", b)
         print()
-        self._log(red("Timeout — no READY signal from device"))
+        self._log(red("Timeout — no READY from device"))
         return False
 
-    # ── Phase 2 — write packet ────────────────────────────────────────────────
+    # ── Send packet ───────────────────────────────────────────────────────────
 
     def send_packet(self, pkt_type: int, payload: bytes, label: str) -> bool:
         TYPE_STR = {PKT_PRIVKEY: "PRIVKEY/0xB1",
@@ -319,10 +389,8 @@ class ProvSession:
         for attempt in range(1, self.max_retries + 1):
             if attempt > 1:
                 self._log(yellow(f"Retry {attempt}/{self.max_retries}…"))
-            self.port.write(packet)
-            self.port.flush()
+            self._conn.send(packet)
             self._sent += 1
-
             resp = self._recv(timeout=self.byte_timeout)
             if resp is None:
                 self._log(red(f"Timeout waiting for ACK/NAK  (attempt {attempt})"))
@@ -339,23 +407,22 @@ class ProvSession:
         self._log(red(f"Giving up after {self.max_retries} attempts."))
         return False
 
-    # ── Phase 2 — read config (GET_CONFIG) ───────────────────────────────────
+    # ── Get config ────────────────────────────────────────────────────────────
 
     def _recv_packet_from_sof(self) -> Optional[Tuple[int, bytes]]:
-        """Read TYPE+LEN+PAYLOAD+CRC after SOF has already been consumed."""
         frame = bytearray([PROV_SOF])
-        for _ in range(2):           # TYPE, LEN
+        for _ in range(2):
             b = self._recv(self.byte_timeout)
             if b is None:
                 return None
             frame.append(b)
         pkt_len = frame[2]
-        for _ in range(pkt_len):     # PAYLOAD
+        for _ in range(pkt_len):
             b = self._recv(self.byte_timeout)
             if b is None:
                 return None
             frame.append(b)
-        for _ in range(2):           # CRC HI, LO
+        for _ in range(2):
             b = self._recv(self.byte_timeout)
             if b is None:
                 return None
@@ -371,9 +438,7 @@ class ProvSession:
         print(f"\n  {bold('▸  GET_CONFIG request')}")
         if self.verbose:
             _hex_dump("Packet", packet)
-
-        self.port.write(packet)
-        self.port.flush()
+        self._conn.send(packet)
 
         resp = self._recv(timeout=self.byte_timeout)
         if resp is None:
@@ -399,29 +464,16 @@ class ProvSession:
         self._log(yellow(f"Unexpected response 0x{resp:02X}"))
         return None
 
-    # ── Phase 3 ───────────────────────────────────────────────────────────────
-
-    def send_eot(self) -> bool:
-        print(f"\n  {bold('▸  EOT')}  (end of transmission)")
-        self.port.write(bytes([PROV_EOT]))
-        self.port.flush()
-        resp = self._recv(timeout=self.byte_timeout)
-        if resp == PROV_ACK:
-            self._log(green("ACK  ✓  device writing flash…"))
-            time.sleep(0.8)
-            return True
-        got = f"0x{resp:02X}" if resp is not None else "timeout"
-        self._log(red(f"No ACK for EOT (got {got})"))
-        return False
+    # ── Summary ───────────────────────────────────────────────────────────────
 
     def print_summary(self, success: bool) -> None:
         sep = "─" * 46
         print(f"\n{sep}")
-        print(bold("  Summary"))
-        print(f"  Packets sent   :  {self._sent}")
-        print(f"  Packets ACKed  :  {self._acked}")
+        if self._sent:
+            print(f"  Packets sent   :  {self._sent}")
+            print(f"  Packets ACKed  :  {self._acked}")
         print(f"  Result         :  "
-              + (green("SUCCESS — flash updated") if success else red("FAILED")))
+              + (green("OK") if success else red("FAILED")))
         print(sep)
 
 
@@ -430,13 +482,12 @@ class ProvSession:
 def _hex_dump(label: str, data: bytes, cols: int = 16) -> None:
     print(f"   {label}  ({len(data)} B):")
     for i in range(0, len(data), cols):
-        chunk    = data[i:i + cols]
-        hex_part = " ".join(f"{b:02x}" for b in chunk)
-        asc_part = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
-        print(f"     {i:04x}  {hex_part:<{cols * 3}} {asc_part}")
+        chunk = data[i:i + cols]
+        print(f"     {i:04x}  {' '.join(f'{b:02x}' for b in chunk):<{cols*3}}"
+              f"  {''.join(chr(b) if 0x20 <= b < 0x7F else '.' for b in chunk)}")
 
 
-# ── Port helpers ──────────────────────────────────────────────────────────────
+# ── Connection management ─────────────────────────────────────────────────────
 
 def _resolve_port(port: str) -> str:
     try:
@@ -447,7 +498,15 @@ def _resolve_port(port: str) -> str:
         pass
     return port
 
-def _open_port(settings: Settings) -> Optional[serial.Serial]:
+def ensure_connected(settings: Settings) -> bool:
+    """
+    Open the port and wait for READY if not already connected.
+    Starts the ping thread after READY is received.
+    Returns True if connected (or already was).
+    """
+    if _gs.conn is not None:
+        return True
+
     try:
         ser = serial.Serial(
             port=settings["port"],
@@ -458,79 +517,81 @@ def _open_port(settings: Settings) -> Optional[serial.Serial]:
         )
         ser.reset_input_buffer()
         ser.reset_output_buffer()
-        return ser
     except serial.SerialException as exc:
         print(red(f"\n  Cannot open {settings['port']}: {exc}"))
-        return None
+        return False
+
+    conn = ActiveSession(ser)
+    prov = ProvSession(conn,
+                       max_retries=settings["max_retries"],
+                       byte_timeout=settings["byte_timeout"],
+                       verbose=settings["verbose"])
+
+    if not prov.wait_for_ready(timeout=settings["wait_timeout"]):
+        conn.close(commit=False)
+        return False
+
+    conn.start_ping()
+    _gs.conn = conn
+    _gs.prov = prov
+    print(green("  Session open — device held alive by keepalive ping."))
+    return True
+
+def disconnect(commit: bool = True) -> None:
+    if _gs.conn is None:
+        return
+    msg = "Disconnecting and writing flash…" if commit else "Disconnecting (no flash write)…"
+    print(f"\n  {msg}")
+    _gs.conn.close(commit=commit)
+    _gs.conn = None
+    _gs.prov = None
+    print(green("  Disconnected."))
 
 
 # ── Flash / get-config operations ─────────────────────────────────────────────
 
 def do_flash(packets: List[Tuple[int, bytes, str]], settings: Settings) -> bool:
-    """Open port, send packets, send EOT.  Returns success."""
-    ser = _open_port(settings)
-    if ser is None:
+    if not ensure_connected(settings):
         return False
-
-    sess = ProvSession(ser,
-                       max_retries=settings["max_retries"],
-                       byte_timeout=settings["byte_timeout"],
-                       verbose=settings["verbose"])
+    prov = _gs.prov
+    prov.reset_counters()
     success = True
-    if not sess.wait_for_ready(timeout=settings["wait_timeout"]):
-        ser.close()
-        return False
-
     for pkt_type, payload, label in packets:
-        if not sess.send_packet(pkt_type, payload, label):
+        if not prov.send_packet(pkt_type, payload, label):
             success = False
             break
-
-    if success:
-        success = sess.send_eot()
-
-    ser.close()
-    sess.print_summary(success)
+    prov.print_summary(success)
     return success
 
 def do_get_config(settings: Settings) -> Optional[Dict[str, int]]:
-    """Open port, send GET_CONFIG, return config dict or None."""
-    ser = _open_port(settings)
-    if ser is None:
+    if not ensure_connected(settings):
         return None
-
-    sess = ProvSession(ser,
-                       max_retries=1,
-                       byte_timeout=settings["byte_timeout"],
-                       verbose=settings["verbose"])
-    result = None
-    if sess.wait_for_ready(timeout=settings["wait_timeout"]):
-        result = sess.get_config()
-        # Always end the session gracefully
-        ser.write(bytes([PROV_EOT]))
-        ser.flush()
-        ser.read(1)   # consume ACK (best-effort)
-
-    ser.close()
-    return result
+    return _gs.prov.get_config()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TUI — helpers
+#  TUI helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _clear() -> None:
     os.system("cls" if os.name == "nt" else "clear")
 
 def _header(settings: Settings, subtitle: str = "") -> None:
+    box_w    = 52
     port_str = _resolve_port(settings["port"])
-    box_w = 50
+    if _gs.conn is not None:
+        conn_str = green("●") + " Connected"
+        port_line = f"{port_str}  {conn_str}"
+    else:
+        conn_str = dim("○") + " Offline"
+        port_line = f"{port_str}  {conn_str}"
+
     print("╔" + "═" * box_w + "╗")
     print(f"║  {'FoF Field Provisioning Tool':<{box_w - 2}}║")
-    print(f"║  {port_str:<{box_w - 2}}║")
+    print(f"║  {port_line:<{box_w - 2 + (9 if _COLOR else 0)}}║")
     print("╚" + "═" * box_w + "╝")
     if subtitle:
-        print(f"\n── {subtitle} " + "─" * max(0, box_w - len(subtitle) - 1))
+        print(f"\n── {subtitle} " + "─" * max(0, box_w - len(subtitle)))
     print()
 
 def _pause(msg: str = "Press Enter to return…") -> None:
@@ -540,15 +601,13 @@ def _pause(msg: str = "Press Enter to return…") -> None:
         pass
 
 def _choose(options: List[str], *, zero_label: str = "Back") -> int:
-    """Print numbered options; return 1-based selection or 0 for zero_label."""
     for i, label in enumerate(options, 1):
         print(f"  {i}.  {label}")
     print(f"  0.  {zero_label}")
     print()
     while True:
         try:
-            raw = input("  Select: ").strip()
-            n   = int(raw)
+            n = int(input("  Select: ").strip())
             if 0 <= n <= len(options):
                 return n
         except (ValueError, KeyboardInterrupt, EOFError):
@@ -561,24 +620,20 @@ def _ask_yn(prompt: str, default: bool = True) -> bool:
         raw = input(f"  {prompt} {hint}: ").strip().lower()
     except (KeyboardInterrupt, EOFError):
         return default
-    if not raw:
-        return default
-    return raw.startswith("y")
+    return raw.startswith("y") if raw else default
 
 def _file_line(label: str, path: Path, expected_size: int) -> str:
     if path.exists():
         size = path.stat().st_size
-        size_ok = size == expected_size
-        icon = green("✓") if size_ok else yellow("!")
-        detail = f"{size} B" + ("" if size_ok else f"  ← expected {expected_size}")
+        icon = green("✓") if size == expected_size else yellow("!")
+        detail = f"{size} B" + ("" if size == expected_size else f"  ← expected {expected_size}")
     else:
-        icon   = red("✗")
-        detail = "not found"
-    return f"  {icon}  {label:<16} {str(path):<34}  [{detail}]"
+        icon, detail = red("✗"), "not found"
+    return f"  {icon}  {label:<16} {str(path):<36} [{detail}]"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TUI — menus
+#  TUI menus
 # ─────────────────────────────────────────────────────────────────────────────
 
 def menu_main(settings: Settings) -> None:
@@ -593,8 +648,15 @@ def menu_main(settings: Settings) -> None:
             "Get Configuration",
             "Generate Key Pair",
             "Settings",
+            "Disconnect" if _gs.conn else dim("Disconnect  (not connected)"),
         ], zero_label="Exit")
+
         if choice == 0:
+            if _gs.conn:
+                if _ask_yn("Write flash and disconnect?"):
+                    disconnect(commit=True)
+                else:
+                    disconnect(commit=False)
             break
         elif choice == 1:
             menu_flash_all(settings)
@@ -612,6 +674,13 @@ def menu_main(settings: Settings) -> None:
             menu_generate_keys(settings)
         elif choice == 7:
             menu_settings(settings)
+        elif choice == 8:
+            if _gs.conn:
+                if _ask_yn("Write flash and disconnect?"):
+                    disconnect(commit=True)
+                else:
+                    disconnect(commit=False)
+            # else: no-op, re-displays menu
 
 
 # ── Flash All ─────────────────────────────────────────────────────────────────
@@ -620,13 +689,10 @@ def menu_flash_all(settings: Settings) -> None:
     while True:
         _clear()
         _header(settings, "Flash All")
-        priv_path = settings.privkey_path()
-        pub_path  = settings.pubkey_path()
-        print(_file_line("Private key", priv_path,  PRIVKEY_LEN))
-        print(_file_line("Public key",  pub_path,   PUBKEY_LEN))
+        print(_file_line("Private key", settings.privkey_path(),  PRIVKEY_LEN))
+        print(_file_line("Public key",  settings.pubkey_path(),   PUBKEY_LEN))
         print(f"  {green('✓')}  {'Config':<16} (from settings)  [6 fields]")
         print()
-
         choice = _choose(["Start", "Edit config values"])
         if choice == 0:
             break
@@ -643,16 +709,14 @@ def menu_flash_all(settings: Settings) -> None:
             menu_edit_config(settings)
 
 def _collect_key_packets(settings: Settings) -> List[Tuple[int, bytes, str]]:
-    """Load whichever key files exist; warn about missing ones."""
     packets: List[Tuple[int, bytes, str]] = []
-    for path, pkt_type, label, expected_len in [
+    for path, pkt_type, label, elen in [
         (settings.privkey_path(), PKT_PRIVKEY, "Private Key", PRIVKEY_LEN),
         (settings.pubkey_path(),  PKT_PUBKEY,  "Public Key",  PUBKEY_LEN),
     ]:
         if path.exists():
             try:
-                raw = load_key(str(path), expected_len)
-                packets.append((pkt_type, raw, label))
+                packets.append((pkt_type, load_key(str(path), elen), label))
             except Exception as exc:
                 print(yellow(f"  ! Skipping {label}: {exc}"))
         else:
@@ -690,15 +754,11 @@ def menu_flash_key(settings: Settings, pkt_type: int, label: str,
             _pause()
         elif choice == 2:
             try:
-                raw_input = input(f"  Path [{current_path}]: ").strip()
+                v = input(f"  Path [{current_path}]: ").strip()
             except (KeyboardInterrupt, EOFError):
                 continue
-            p = Path(raw_input) if raw_input else current_path
-            if not p.exists():
-                print(red(f"  ✗  Not found: {p}"))
-                _pause()
-            else:
-                current_path = p
+            if v:
+                current_path = Path(v)
 
 
 # ── Flash Configuration ───────────────────────────────────────────────────────
@@ -709,13 +769,12 @@ def menu_flash_config(settings: Settings) -> None:
         _header(settings, "Flash Configuration")
         _print_config(settings["config"])
         print()
-
         choice = _choose(["Start", "Edit values", "Reset to defaults"])
         if choice == 0:
             break
         elif choice == 1:
-            payload = _pack_config(settings["config"])
-            do_flash([(PKT_CONFIG, payload, "Configuration")], settings)
+            do_flash([(PKT_CONFIG, _pack_config(settings["config"]), "Configuration")],
+                     settings)
             _pause()
         elif choice == 2:
             menu_edit_config(settings)
@@ -723,7 +782,6 @@ def menu_flash_config(settings: Settings) -> None:
             settings["config"] = _default_config()
             print(green("  Config reset to defaults."))
             _pause()
-
 
 def menu_edit_config(settings: Settings) -> None:
     while True:
@@ -738,15 +796,14 @@ def menu_edit_config(settings: Settings) -> None:
         print()
 
         try:
-            raw = input("  Select: ").strip()
-            idx = int(raw)
+            idx = int(input("  Select: ").strip())
         except (ValueError, KeyboardInterrupt, EOFError):
             continue
 
         if idx == 0:
             break
         elif 1 <= idx <= len(CONFIG_FIELDS):
-            name, desc, default = CONFIG_FIELDS[idx - 1]
+            name, _, default = CONFIG_FIELDS[idx - 1]
             current = cfg.get(name, default)
             try:
                 v = input(f"  {name} [{current}]: ").strip()
@@ -754,10 +811,7 @@ def menu_edit_config(settings: Settings) -> None:
                 continue
             if v:
                 try:
-                    new_val = int(v)
-                    if new_val < 0:
-                        raise ValueError
-                    cfg[name] = new_val
+                    cfg[name] = max(0, int(v))
                     settings["config"] = cfg
                 except ValueError:
                     print(red("  Invalid — enter a non-negative integer."))
@@ -769,8 +823,7 @@ def menu_edit_config(settings: Settings) -> None:
 
 def _print_config(cfg: Dict[str, int]) -> None:
     for name, desc, default in CONFIG_FIELDS:
-        val = cfg.get(name, default)
-        print(f"  {name:<32}  {val:>6} ms   {dim(desc)}")
+        print(f"  {name:<32}  {cfg.get(name, default):>6} ms   {dim(desc)}")
 
 
 # ── Get Configuration ─────────────────────────────────────────────────────────
@@ -790,7 +843,7 @@ def menu_get_config(settings: Settings) -> None:
             if result is not None:
                 print(f"\n  {green('✓')}  Configuration received:\n")
                 _print_config(result)
-                if _ask_yn("Load these values into settings?"):
+                if _ask_yn("Load these values into local settings?"):
                     settings["config"] = result
                     print(green("  Settings updated."))
             _pause()
@@ -831,19 +884,16 @@ def menu_generate_keys(settings: Settings) -> None:
                 continue
 
             if _ask_yn("Flash to device now?"):
-                packets = [
-                    (PKT_PRIVKEY, priv_bytes, "Private Key"),
-                    (PKT_PUBKEY,  pub_bytes,  "Public Key"),
-                ]
-                do_flash(packets, settings)
+                do_flash([(PKT_PRIVKEY, priv_bytes, "Private Key"),
+                          (PKT_PUBKEY,  pub_bytes,  "Public Key")], settings)
             _pause()
         elif choice == 2:
             try:
-                raw = input(f"  Key directory [{settings['key_dir']}]: ").strip()
+                v = input(f"  Key directory [{settings['key_dir']}]: ").strip()
             except (KeyboardInterrupt, EOFError):
                 continue
-            if raw:
-                settings["key_dir"] = raw
+            if v:
+                settings["key_dir"] = v
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -862,53 +912,52 @@ def menu_settings(settings: Settings) -> None:
         print()
 
         try:
-            raw = input("  Select: ").strip()
-            idx = int(raw)
+            idx = int(input("  Select: ").strip())
         except (ValueError, KeyboardInterrupt, EOFError):
             continue
 
         if idx == 0:
             break
         elif idx == 1:
-            _settings_str(settings, "port", "Serial port", "/dev/serial0")
+            _set_str(settings, "port",         "Serial port")
         elif idx == 2:
-            _settings_int(settings, "baud", "Baud rate", 9600)
+            _set_int(settings, "baud",         "Baud rate")
         elif idx == 3:
-            _settings_int(settings, "max_retries", "Max retries", 3)
+            _set_int(settings, "max_retries",  "Max retries")
         elif idx == 4:
-            _settings_float(settings, "wait_timeout", "Wait timeout (s)", 8.0)
+            _set_float(settings, "wait_timeout", "Wait timeout (s)")
         elif idx == 5:
-            _settings_str(settings, "key_dir", "Key directory", "keys")
+            _set_str(settings, "key_dir",      "Key directory")
         elif idx == 6:
             settings["verbose"] = not settings["verbose"]
 
-def _settings_str(settings: Settings, key: str, label: str, default: str) -> None:
+def _set_str(s: Settings, key: str, label: str) -> None:
     try:
-        v = input(f"  {label} [{settings[key]}]: ").strip()
+        v = input(f"  {label} [{s[key]}]: ").strip()
         if v:
-            settings[key] = v
+            s[key] = v
     except (KeyboardInterrupt, EOFError):
         pass
 
-def _settings_int(settings: Settings, key: str, label: str, default: int) -> None:
+def _set_int(s: Settings, key: str, label: str) -> None:
     try:
-        v = input(f"  {label} [{settings[key]}]: ").strip()
+        v = input(f"  {label} [{s[key]}]: ").strip()
         if v:
-            settings[key] = int(v)
+            s[key] = int(v)
     except (ValueError, KeyboardInterrupt, EOFError):
         pass
 
-def _settings_float(settings: Settings, key: str, label: str, default: float) -> None:
+def _set_float(s: Settings, key: str, label: str) -> None:
     try:
-        v = input(f"  {label} [{settings[key]}]: ").strip()
+        v = input(f"  {label} [{s[key]}]: ").strip()
         if v:
-            settings[key] = float(v)
+            s[key] = float(v)
     except (ValueError, KeyboardInterrupt, EOFError):
         pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Non-interactive CLI  (unchanged behaviour from v1)
+#  Non-interactive CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_parser() -> argparse.ArgumentParser:
@@ -917,7 +966,7 @@ def make_parser() -> argparse.ArgumentParser:
         description="FoF STM32 field provisioning — Raspberry Pi peer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
-        Run without action flags to enter the interactive menu.
+        Run without action flags to enter the interactive TUI.
 
         examples:
           python3 fof_prov.py                            # interactive TUI
@@ -925,48 +974,39 @@ def make_parser() -> argparse.ArgumentParser:
           python3 fof_prov.py --private-key priv.bin     # flash one key
           python3 fof_prov.py --port /dev/ttyAMA0 \\
               --private-key priv.bin --public-key pub.bin \\
-              --tx-timeout 500 --main-delay 2
+              --tx-timeout 500 --transponder-cycle 2
         """),
     )
-
     g = ap.add_argument_group("serial port")
-    g.add_argument("--port",  default=None, help="UART device  (default: from settings)")
-    g.add_argument("--baud",  type=int, default=None, help="baud rate (default: 9600)")
+    g.add_argument("--port",  default=None)
+    g.add_argument("--baud",  type=int, default=None)
 
     g = ap.add_argument_group("key packets")
     g.add_argument("--private-key", metavar="FILE")
     g.add_argument("--public-key",  metavar="FILE")
-    g.add_argument("--generate",    action="store_true",
-                   help="generate a fresh SECP256R1 keypair, save to key-dir, then flash")
+    g.add_argument("--generate", action="store_true",
+                   help="generate a SECP256R1 keypair, save to key-dir, then flash")
 
     g = ap.add_argument_group("config packet  (sent when any flag is provided)")
-    g.add_argument("--tx-timeout",        type=int, metavar="MS",
-                   help="TxTimeoutMs                (default: 500)")
-    g.add_argument("--transponder-cycle", type=int, metavar="MS",
-                   help="TransponderMainCycleMs      (default: 2)")
-    g.add_argument("--challenger-cycle",  type=int, metavar="MS",
-                   help="ChallengerMainCycleMs       (default: 1000)")
-    g.add_argument("--response-wait",     type=int, metavar="MS",
-                   help="ResponseWaitCycleDelayMs    (default: 10)")
-    g.add_argument("--rtt-tolerance",     type=int, metavar="MS",
-                   help="ResponseDelayToleranceMs    (default: 500)")
-    g.add_argument("--watchdog",          type=int, metavar="MS",
-                   help="WatchdogTimeoutMs           (default: 1000)")
+    g.add_argument("--tx-timeout",        type=int, metavar="MS")
+    g.add_argument("--transponder-cycle", type=int, metavar="MS")
+    g.add_argument("--challenger-cycle",  type=int, metavar="MS")
+    g.add_argument("--response-wait",     type=int, metavar="MS")
+    g.add_argument("--rtt-tolerance",     type=int, metavar="MS")
+    g.add_argument("--watchdog",          type=int, metavar="MS")
 
     g = ap.add_argument_group("behaviour")
     g.add_argument("--max-retries",  type=int, default=None, metavar="N")
     g.add_argument("--wait",         type=float, default=None, metavar="SECS",
                    help="seconds to wait for device READY  (default: 30)")
     g.add_argument("--byte-timeout", type=float, default=None, metavar="SECS")
-    g.add_argument("--dry-run",      action="store_true",
-                   help="build and print packets without opening the serial port")
+    g.add_argument("--dry-run",      action="store_true")
     g.add_argument("-v", "--verbose", action="store_true")
 
     return ap
 
 
 def run_cli(args: argparse.Namespace, settings: Settings) -> int:
-    # Override settings with CLI flags
     if args.port:         settings["port"]         = args.port
     if args.baud:         settings["baud"]         = args.baud
     if args.max_retries:  settings["max_retries"]  = args.max_retries
@@ -979,14 +1019,12 @@ def run_cli(args: argparse.Namespace, settings: Settings) -> int:
 
     # Key generation
     if args.generate:
-        out_dir = settings.key_dir_path()
-        print(f"Generating SECP256R1 keypair → {out_dir}/")
         try:
-            priv_bytes, pub_bytes = generate_keypair(out_dir)
-            print(green(f"  ✓  private.bin  [{len(priv_bytes)} B]"))
-            print(green(f"  ✓  public.bin   [{len(pub_bytes)} B]"))
-            packets.append((PKT_PRIVKEY, priv_bytes, "Private Key"))
-            packets.append((PKT_PUBKEY,  pub_bytes,  "Public Key"))
+            priv, pub = generate_keypair(settings.key_dir_path())
+            print(green(f"  ✓  private.bin  [{len(priv)} B]"))
+            print(green(f"  ✓  public.bin   [{len(pub)} B]"))
+            packets += [(PKT_PRIVKEY, priv, "Private Key"),
+                        (PKT_PUBKEY,  pub,  "Public Key")]
         except Exception as exc:
             errors.append(f"--generate: {exc}")
 
@@ -1004,8 +1042,7 @@ def run_cli(args: argparse.Namespace, settings: Settings) -> int:
         except Exception as exc:
             errors.append(f"--public-key: {exc}")
 
-    # Config
-    cfg_flags = {
+    cfg_overrides = {
         "TxTimeoutMs":              args.tx_timeout,
         "TransponderMainCycleMs":   args.transponder_cycle,
         "ChallengerMainCycleMs":    args.challenger_cycle,
@@ -1013,17 +1050,12 @@ def run_cli(args: argparse.Namespace, settings: Settings) -> int:
         "ResponseDelayToleranceMs": args.rtt_tolerance,
         "WatchdogTimeoutMs":        args.watchdog,
     }
-    if any(v is not None for v in cfg_flags.values()):
+    if any(v is not None for v in cfg_overrides.values()):
         cfg = dict(settings["config"])
-        for k, v in cfg_flags.items():
+        for k, v in cfg_overrides.items():
             if v is not None:
                 cfg[k] = v
-        payload = _pack_config(cfg)
-        vals    = struct.unpack("<6I", payload)
-        label   = ("Configuration\n"
-                   + "\n".join(f"   {n}={v}"
-                               for (n, _, _), v in zip(CONFIG_FIELDS, vals)))
-        packets.append((PKT_CONFIG, payload, label))
+        packets.append((PKT_CONFIG, _pack_config(cfg), "Configuration"))
 
     if errors:
         for e in errors:
@@ -1035,19 +1067,18 @@ def run_cli(args: argparse.Namespace, settings: Settings) -> int:
         make_parser().print_usage()
         return 1
 
-    print(bold(f"\nFoF provisioning — {len(packets)} packet(s):"))
-    for _, payload, label in packets:
-        print(f"  • {label.splitlines()[0]}  ({len(payload)} B)")
-
     if args.dry_run:
-        print(yellow("\n[DRY RUN] packets not transmitted."))
-        if args.verbose:
-            for pkt_type, payload, label in packets:
-                pkt = build_packet(pkt_type, payload)
-                _hex_dump(label.splitlines()[0], pkt)
+        print(bold(f"\nDRY RUN — {len(packets)} packet(s):"))
+        for pkt_type, payload, label in packets:
+            pkt = build_packet(pkt_type, payload)
+            print(f"  {label}  ({len(payload)} B payload, {len(pkt)} B wire)")
+            if args.verbose:
+                _hex_dump(label, pkt)
         return 0
 
     success = do_flash(packets, settings)
+    if _gs.conn:
+        disconnect(commit=success)
     return 0 if success else 1
 
 
@@ -1070,16 +1101,13 @@ def main() -> int:
         args.tx_timeout, args.transponder_cycle, args.challenger_cycle,
         args.response_wait, args.rtt_tolerance, args.watchdog,
     ]
-    is_interactive = (
-        not args.generate
-        and all(f is None for f in action_flags)
-    )
-
-    if is_interactive:
+    if not args.generate and all(f is None for f in action_flags):
         try:
             menu_main(settings)
         except (KeyboardInterrupt, EOFError):
             print()
+            if _gs.conn:
+                disconnect(commit=False)
         return 0
 
     return run_cli(args, settings)

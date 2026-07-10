@@ -30,9 +30,10 @@
 /* ============================================================================
  * Timing
  * ============================================================================ */
-#define DETECT_TIMEOUT_MS  2000u  /* per READY attempt                   */
-#define DETECT_ATTEMPTS    3u     /* total READY attempts before giving up */
-#define BYTE_TIMEOUT_MS    500u   /* per-byte timeout inside a packet     */
+#define DETECT_TIMEOUT_MS       2000u  /* per READY attempt (detection phase)         */
+#define SESSION_IDLE_TIMEOUT_MS 5000u  /* between packets in an active session        */
+#define DETECT_ATTEMPTS         3u     /* total READY attempts before giving up       */
+#define BYTE_TIMEOUT_MS         500u   /* per-byte timeout inside a packet            */
 #define SUCCESS_SHOW_MS    3000u  /* steady LED duration after success    */
 #define ERROR_SHOW_MS      10000u /* SOS LED duration after error         */
 
@@ -311,8 +312,10 @@ UartProvResult uart_prov_run(void)
         first_byte = 0u;
 
         if (b == 0u) {
-            /* Wait for SOF or EOT from counterpart */
-            if (!uart_recv_byte(&b, DETECT_TIMEOUT_MS)) {
+            /* Wait for SOF, EOT, or PING from counterpart.
+             * SESSION_IDLE_TIMEOUT_MS >> ping interval (1 s), so one missed
+             * ping does not drop the session prematurely. */
+            if (!uart_recv_byte(&b, SESSION_IDLE_TIMEOUT_MS)) {
                 session_err = true;
                 break;
             }

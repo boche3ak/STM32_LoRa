@@ -6,7 +6,11 @@
       "Bash(cmake -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake -DCMAKE_BUILD_TYPE=Debug -B build)",
       "Bash(cmake --build build)",
       "Bash(cmake --preset debug)",
-      "Bash(cmake --preset release)"
+      "Bash(cmake --preset release)",
+      "PowerShell(cmake \"C:\\\\A01_PROJECTS\\\\FoF\\\\STM32_LoRa\" -G Ninja -B \"C:\\\\A01_PROJECTS\\\\FoF\\\\STM32_LoRa\\\\build\\\\debug\" -S \"C:\\\\A01_PROJECTS\\\\FoF\\\\STM32_LoRa\" -DCMAKE_TOOLCHAIN_FILE=\"C:\\\\A01_PROJECTS\\\\FoF\\\\STM32_LoRa\\\\cmake\\\\gcc-arm-none-eabi.cmake\" -DCMAKE_BUILD_TYPE=Debug 2>&1)",
+      "PowerShell(cmake --build \"C:\\\\A01_PROJECTS\\\\FoF\\\\STM32_LoRa\\\\build\\\\debug\" 2>&1)",
+      "PowerShell(cmake --build \"C:\\\\A01_PROJECTS\\\\FoF\\\\STM32_LoRa\\\\build\\\\debug\" 2>&1 | Where-Object { $_ -match \"error:|warning:|Built target|bytes\" } | Select-Object -Last 8)",
+      "PowerShell(cmake --build \"C:\\\\A01_PROJECTS\\\\FoF\\\\STM32_LoRa\\\\build\\\\debug\" --clean-first 2>&1)"
     ]
   }
 }
