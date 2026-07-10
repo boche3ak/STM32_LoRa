@@ -322,10 +322,109 @@ class ActiveSession:
 # ── Global session state ──────────────────────────────────────────────────────
 
 class _State:
-    conn: Optional[ActiveSession] = None
-    prov: Optional["ProvSession"] = None
+    conn:      Optional[ActiveSession]  = None
+    prov:      Optional["ProvSession"]  = None
+    _settings: Optional["Settings"]     = None   # updated by start_auto_connect
+    _ac_thread: Optional[threading.Thread] = None
 
 _gs = _State()
+
+
+# ── Background auto-connect thread ────────────────────────────────────────────
+
+def _auto_connect_worker() -> None:
+    """
+    Daemon thread: keeps the serial port open and listens for PROV_READY.
+
+    Lifecycle:
+      • While _gs.conn is None: open port, block-read for READY (2 s per read),
+        establish session when READY arrives, print a brief notification.
+      • While _gs.conn is not None: sleep until session disappears (disconnect).
+      • On disconnect: loop restarts — port is re-opened and READY is awaited
+        again (for the next provisioning cycle / device reboot).
+
+    Settings (_gs._settings) are re-read each outer iteration so that port or
+    baud changes made in the Settings menu take effect without restarting the
+    thread.
+    """
+    while True:
+        s = _gs._settings
+        if s is None:
+            time.sleep(0.5)
+            continue
+
+        # ── Session active: just wait ────────────────────────────────────────
+        if _gs.conn is not None:
+            time.sleep(2.0)
+            continue
+
+        # ── Try to open port ─────────────────────────────────────────────────
+        ser = None
+        try:
+            ser = serial.Serial(
+                port     = s["port"],
+                baudrate = s["baud"],
+                bytesize = serial.EIGHTBITS,
+                parity   = serial.PARITY_NONE,
+                stopbits = serial.STOPBITS_ONE,
+            )
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+        except serial.SerialException:
+            if ser is not None:
+                try: ser.close()
+                except Exception: pass
+            time.sleep(3.0)
+            continue
+
+        # ── Wait for READY on open port ──────────────────────────────────────
+        ser.timeout = 2.0          # short per-read timeout so we stay responsive
+        connected   = False
+        try:
+            while _gs.conn is None and _gs._settings is s:
+                data = ser.read(1)
+                if not data:
+                    continue       # read timed out, keep waiting
+                if data[0] == PROV_READY:
+                    ser.reset_input_buffer()
+                    conn = ActiveSession(ser)
+                    prov = ProvSession(conn,
+                                       max_retries  = s["max_retries"],
+                                       byte_timeout = s["byte_timeout"],
+                                       verbose      = s["verbose"])
+                    conn.start_ping()
+                    _gs.conn = conn
+                    _gs.prov = prov
+                    ser       = None    # ownership transferred — do NOT close below
+                    connected = True
+                    print(f"\n  {green('●')} Device connected  [{s['port']}]",
+                          flush=True)
+                    break
+                # Other byte (noise): ignore and keep listening
+        except Exception:
+            pass
+        finally:
+            if ser is not None:    # only close if we still own it
+                try: ser.close()
+                except Exception: pass
+
+        if not connected:
+            time.sleep(0.5)        # brief pause before re-trying
+
+
+def start_auto_connect(settings: "Settings") -> None:
+    """
+    Update the settings reference and start the auto-connect daemon if needed.
+
+    Safe to call repeatedly — only spawns a new thread when the existing one
+    is no longer alive (first call, or after unexpected thread death).
+    """
+    _gs._settings = settings       # always refresh so thread sees new values
+    if _gs._ac_thread is not None and _gs._ac_thread.is_alive():
+        return
+    t = threading.Thread(target=_auto_connect_worker, daemon=True)
+    t.start()
+    _gs._ac_thread = t
 
 
 # ── Provisioning session ──────────────────────────────────────────────────────
@@ -352,29 +451,6 @@ class ProvSession:
 
     def _recv(self, timeout: float) -> Optional[int]:
         return self._conn.recv(timeout)
-
-    # ── Wait for READY ────────────────────────────────────────────────────────
-
-    def wait_for_ready(self, timeout: float = 30.0) -> bool:
-        print(f"\n  {cyan('Waiting for device READY…')}")
-        print(f"  Port {self._conn.ser.name}  │  {self._conn.ser.baudrate} baud  │  8N1")
-        print(f"  (power on or reset the device within {timeout:.0f} s)\n")
-        deadline = time.monotonic() + timeout
-        dots = 0
-        while time.monotonic() < deadline:
-            b = self._recv(timeout=min(0.5, deadline - time.monotonic()))
-            if b is None:
-                dots += 1
-                print(f"  {'.' * (dots % 6 + 1):<7}", end="\r", flush=True)
-                continue
-            if b == PROV_READY:
-                print()
-                self._log(green("READY  (0x{:02X})".format(b)))
-                return True
-            logging.debug("ignored 0x%02X waiting for READY", b)
-        print()
-        self._log(red("Timeout — no READY from device"))
-        return False
 
     # ── Send packet ───────────────────────────────────────────────────────────
 
@@ -531,48 +607,33 @@ def _resolve_port(port: str) -> str:
 
 def ensure_connected(settings: Settings) -> bool:
     """
-    Open the port and wait for READY if not already connected.
-    Starts the ping thread after READY is received.
-    Returns True if connected (or already was).
+    Return True when a session is open, blocking up to wait_timeout seconds.
+
+    The auto-connect thread is responsible for opening the port and receiving
+    READY.  This function just starts that thread (if not running) and polls
+    _gs.conn until it is set or the timeout expires.
     """
     if _gs.conn is not None:
         return True
 
-    try:
-        ser = serial.Serial(
-            port=settings["port"],
-            baudrate=settings["baud"],
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-        )
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
-    except serial.SerialException as exc:
-        print(red(f"\n  Cannot open {settings['port']}: {exc}"))
-        return False
+    start_auto_connect(settings)
 
-    conn = ActiveSession(ser)
-    prov = ProvSession(conn,
-                       max_retries=settings["max_retries"],
-                       byte_timeout=settings["byte_timeout"],
-                       verbose=settings["verbose"])
+    print(f"\n  {cyan('Waiting for device…')}")
+    print(f"  Port {_resolve_port(settings['port'])}  │  {settings['baud']} baud  │  8N1")
+    print(f"  (power on or reset the device within {settings['wait_timeout']:.0f} s)\n")
 
-    if not prov.wait_for_ready(timeout=settings["wait_timeout"]):
-        conn.close(commit=False)
-        return False
+    deadline = time.monotonic() + settings["wait_timeout"]
+    dots = 0
+    while time.monotonic() < deadline:
+        if _gs.conn is not None:
+            return True
+        time.sleep(0.5)
+        dots += 1
+        print(f"  {'.' * (dots % 6 + 1):<7}", end="\r", flush=True)
 
-    # Flush any extra READY bytes the device may have sent while the Pi was
-    # starting up.  wait_for_ready consumes exactly one READY and returns; any
-    # additional 0xAA bytes left in the OS buffer would be read as the first
-    # byte of the next response and corrupt it.
-    ser.reset_input_buffer()
-
-    conn.start_ping()
-    _gs.conn = conn
-    _gs.prov = prov
-    print(green("  Session open — device held alive by keepalive ping."))
-    return True
+    print()
+    print(red("  Timeout — no READY from device"))
+    return False
 
 def disconnect(commit: bool = True) -> None:
     if _gs.conn is None:
@@ -674,6 +735,7 @@ def _file_line(label: str, path: Path, expected_size: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def menu_main(settings: Settings) -> None:
+    start_auto_connect(settings)   # begin listening for device READY immediately
     while True:
         _clear()
         _header(settings)
@@ -957,8 +1019,10 @@ def menu_settings(settings: Settings) -> None:
             break
         elif idx == 1:
             _set_str(settings, "port",         "Serial port")
+            start_auto_connect(settings)   # update thread's port reference
         elif idx == 2:
             _set_int(settings, "baud",         "Baud rate")
+            start_auto_connect(settings)
         elif idx == 3:
             _set_int(settings, "max_retries",  "Max retries")
         elif idx == 4:
