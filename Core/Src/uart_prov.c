@@ -351,13 +351,19 @@ UartProvResult uart_prov_run(void)
 
         if (pkt_ok) {
             if (pkt.type == PROV_GET_CONFIG) {
-                /* Send current NVRAM config back as a CONFIG packet. */
+                /*
+                 * Send the config from nvram_shadow, not from flash.
+                 * nvram_shadow is seeded from flash at session start and patched
+                 * in-place by any PROV_TYPE_CONFIG write during this session.
+                 * Reading flash here would return stale values whenever a write
+                 * has been received but EOT (flash commit) not yet sent.
+                 */
                 uint8_t resp[3u + PROV_CONFIG_LEN];
                 resp[0u] = PROV_SOF;
                 resp[1u] = PROV_TYPE_CONFIG;
                 resp[2u] = PROV_CONFIG_LEN;
                 memcpy(&resp[3u],
-                       (const void *)(NVRAM_BASE_ADDR + NVRAM_CONFIG_OFF),
+                       nvram_shadow + NVRAM_CONFIG_OFF,
                        PROV_CONFIG_LEN);
                 uint16_t resp_crc = crc16_ccitt(resp, (uint16_t)(3u + PROV_CONFIG_LEN));
                 for (uint8_t i = 0u; i < (uint8_t)sizeof(resp); i++) uart_send(resp[i]);
