@@ -282,8 +282,23 @@ UartProvResult uart_prov_run(void)
     for (uint8_t attempt = 0u; attempt < DETECT_ATTEMPTS && !detected; attempt++)
     {
         uart_send(PROV_READY);
-        if (uart_recv_byte(&first_byte, DETECT_TIMEOUT_MS))
-            detected = true;
+        if (uart_recv_byte(&first_byte, DETECT_TIMEOUT_MS)) {
+            /*
+             * Accept only meaningful protocol bytes.  With pull-up on PA10 the
+             * RX line is held idle-high, but if noise still produces a byte we
+             * do not want to enter the session loop on garbage.
+             * Valid first bytes from the counterpart:
+             *   PROV_PING (0x05) — keepalive sent every second after READY
+             *   PROV_SOF  (0x55) — start of the first data packet
+             *   PROV_EOT  (0x04) — immediate end-of-session (unusual but valid)
+             */
+            if (   first_byte == PROV_PING
+                || first_byte == PROV_SOF
+                || first_byte == PROV_EOT) {
+                detected = true;
+            }
+            /* else: noise byte — discard and try the next READY attempt */
+        }
     }
 
     if (!detected) {

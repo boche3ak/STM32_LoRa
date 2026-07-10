@@ -8,7 +8,7 @@
   *
   *  GPIO mapping (no AFIO remap needed for USART1 default pins):
   *    PA9  — USART1_TX : alternate-function push-pull, 50 MHz
-  *    PA10 — USART1_RX : floating input
+  *    PA10 — USART1_RX : input with internal pull-up (holds RX idle-high when disconnected)
   ******************************************************************************
   */
 
@@ -28,10 +28,13 @@ void MX_USART1_UART_Init(void)
 
     /*
      * Configure PA10 (USART1_RX) in CRH:
-     *   bits [11:8] → MODE10[1:0] = 00 (input), CNF10[1:0] = 01 (floating input)
-     *   nibble value: 0b0100 = 0x4
+     *   bits [11:8] → MODE10[1:0] = 00 (input), CNF10[1:0] = 10 (input with pull-up/down)
+     *   nibble value: 0b1000 = 0x8
+     * ODR10 = 1 selects pull-UP, holding RX high (= UART idle) when nothing is connected.
+     * This prevents the floating pin from registering noise as false start bits.
      */
-    GPIOA->CRH = (GPIOA->CRH & ~(0xFu << 8u)) | (0x4u << 8u);
+    GPIOA->CRH = (GPIOA->CRH & ~(0xFu << 8u)) | (0x8u << 8u);
+    GPIOA->ODR |= (1u << 10u);   /* pull-up on PA10 */
 
     /* Baud rate: fPCLK2 / 9600  (BRR integer+fractional division) */
     USART1->BRR = (uint16_t)(HAL_RCC_GetPCLK2Freq() / 9600u);
