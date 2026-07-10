@@ -78,7 +78,7 @@ enum {
  * The Challenger stores the reply in the Dbg_Ping* variables for inspection
  * in the debugger; no pin indication logic is involved.
  * ---------------------------------------------------------------------------*/
-#define TEST_PING_MODE
+//#define TEST_PING_MODE
 #define TEST_PING_LEN                  4u
 
 /* predefined parameters*/
@@ -645,13 +645,18 @@ static void TransponderTestLoop(void) {
   while(stayActive){
     if(loRaRxReady){
       loRaRxReady = 0u;
-      LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
+      /* reply only to complete, CRC-clean frames */
+      if(LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH) < TEST_PING_LEN){
+        continue;
+      }
       Dbg_PingRxCount++;
 
       for(uint8_t i = 0u; i < TEST_PING_LEN; i++){
         Dbg_PingRxData[i] = RxBuffer[i];
         TxBuffer[i] = (uint8_t)~RxBuffer[i];
       }
+      //little delay to avoid collision with the end of the reception
+      HAL_Delay(10u);
 
       LoRa_transmit(&loRa, TxBuffer, TEST_PING_LEN, Cfg_TxTimeoutMs);
       Dbg_PingTxCount++;
@@ -741,17 +746,33 @@ static void ChallengerLoop(void) {
       PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);// Toggle TX (off)
       if(!loRaRxReady){
         PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* timeout — no reply or foe */
+        /* LED indication: double blink on timeout (test-style, to be replaced) */
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+        HAL_Delay(50u);
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+        HAL_Delay(50u);
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+        HAL_Delay(50u);
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+        HAL_Delay(50u);
       } else {
         uint32_t roundTripMs   = HAL_GetTick() - txTimestamp;
         uint32_t echoCounter   = 0u;
         uint32_t transponderTs = 0u;
-        LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
+        uint8_t  rxLen = LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
 
-        if(DecodeResponsePackage(RxBuffer, RESPONSE_PACKET_LEN,
-                                 &echoCounter, &transponderTs) == OK
+        if(rxLen >= RESPONSE_PACKET_LEN
+           && DecodeResponsePackage(RxBuffer, RESPONSE_PACKET_LEN,
+                                    &echoCounter, &transponderTs) == OK
            && echoCounter == sentCounter
            && roundTripMs <= Cfg_ResponseDelayToleranceMs){
           PIN_WRITE_STAT_FRIEND_FOF(STAT_FRIEND);
+          /* LED indication: friend confirmed (test-style, to be replaced) */
+          PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+          HAL_Delay(100u);
+          PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+          HAL_Delay(100u);
+          PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
         } else {
           PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* bad HMAC, counter mismatch, or delay exceeded */
         }
@@ -774,25 +795,43 @@ static void ChallengerLoop(void) {
 static void TransponderLoop(void) {
   ComputeSharedSecret();
 
+  PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET); /* LED on: listening */
   LoRa_startReceiving(&loRa); /* silent listen; reception is IRQ-driven */
+  uint8_t ledState = GPIO_PIN_RESET;
 
   while(stayActive){
     if(loRaRxReady){
       uint32_t rxTimestamp = HAL_GetTick(); /* capture arrival time before any processing */
       loRaRxReady = 0u;
-      LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
+      /* process only complete, CRC-clean frames; skips HMAC work on noise */
+      if(LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH) < CHALLENGE_PACKET_LEN){
+        continue;
+      }
 
       uint32_t echoCounter = 0u;
       if(DecodeChallengePackage(RxBuffer, CHALLENGE_PACKET_LEN, &echoCounter) == OK){
         if(EncodeResponsePackage(TxBuffer, TXRX_BUFFER_MAX_LENGTH, echoCounter, rxTimestamp) == OK){
+          /* little delay so the Challenger has completed its TX->RX turnaround */
+          HAL_Delay(10u);
           LoRa_transmit(&loRa, TxBuffer, RESPONSE_PACKET_LEN, Cfg_TxTimeoutMs);
           LoRa_startReceiving(&loRa); /* return to silent listen after reply */
+
+          /* LED indication: negative-flash 3x after a valid challenge was
+           * answered (test-style, to be replaced) */
+          for(uint8_t i = 0u; i < 3u; i++){
+            PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);   /* dark pulse */
+            HAL_Delay(50u);
+            PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET); /* back to lit */
+            HAL_Delay(50u);
+            WATCHDOG_REFRESH();
+          }
         }
       }
     }
     UpdateModemStatusDebug();
     UpdateIrqFlagsDebug();
     HAL_Delay(WATCHDOG_SAFE_POLL_MS(Cfg_TransponderMainCycleMs));
+    PIN_WRITE_STAT_POWERON(ledState^=1u); /* toggle LED to indicate the transponder is alive */
     WATCHDOG_REFRESH();
   }//while stay active ** Transponder main loop **
 }

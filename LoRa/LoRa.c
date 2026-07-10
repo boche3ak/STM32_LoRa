@@ -518,8 +518,12 @@ uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint8_t length){
 
   LoRa_gotoMode(_LoRa, STNBY_MODE);
   read = LoRa_read(_LoRa, RegIrqFlags);
-  if((read & 0x40) != 0){
-    LoRa_write(_LoRa, RegIrqFlags, 0xFF);
+  /* Always clear the IRQ flags, even for rejected frames - otherwise DIO0
+   * stays latched high and the (rising-edge) EXTI never fires again. */
+  LoRa_write(_LoRa, RegIrqFlags, 0xFF);
+  /* Accept only frames with RxDone set AND PayloadCrcError clear;
+   * a corrupted payload returns 0 bytes as if nothing was received. */
+  if(((read & 0x40) != 0) && ((read & 0x20) == 0)){
     number_of_bytes = LoRa_read(_LoRa, RegRxNbBytes);
     read = LoRa_read(_LoRa, RegFiFoRxCurrentAddr);
     LoRa_write(_LoRa, RegFiFoAddPtr, read);
@@ -528,7 +532,7 @@ uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint8_t length){
       data[i] = LoRa_read(_LoRa, RegFiFo);
   }
   LoRa_gotoMode(_LoRa, RXCONTIN_MODE);
-    return min;
+  return min;
 }
 
 /* ----------------------------------------------------------------------------- *\
