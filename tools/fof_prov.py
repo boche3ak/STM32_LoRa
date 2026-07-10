@@ -588,7 +588,7 @@ def _header(settings: Settings, subtitle: str = "") -> None:
 
     print("╔" + "═" * box_w + "╗")
     print(f"║  {'FoF Field Provisioning Tool':<{box_w - 2}}║")
-    print(f"║  {port_line:<{box_w - 2 + (9 if _COLOR else 0)}}║")
+    print(f"║  {port_line:<{box_w - 3 + (9 if _COLOR else 0)}}║")
     print("╚" + "═" * box_w + "╝")
     if subtitle:
         print(f"\n── {subtitle} " + "─" * max(0, box_w - len(subtitle)))
