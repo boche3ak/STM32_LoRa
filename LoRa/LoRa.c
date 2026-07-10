@@ -105,11 +105,9 @@ void LoRa_gotoMode(LoRa* _LoRa, int mode){
 void LoRa_readReg(LoRa* _LoRa, uint8_t* address, uint16_t r_length, uint8_t* output, uint16_t w_length){
   HAL_GPIO_WritePin(_LoRa->CS_port, _LoRa->CS_pin, GPIO_PIN_RESET);
   HAL_SPI_Transmit(_LoRa->hSPIx, address, r_length, TRANSMIT_TIMEOUT);
-  while (HAL_SPI_GetState(_LoRa->hSPIx) != HAL_SPI_STATE_READY)
-    ;
+  while (HAL_SPI_GetState(_LoRa->hSPIx) != HAL_SPI_STATE_READY);
   HAL_SPI_Receive(_LoRa->hSPIx, output, w_length, RECEIVE_TIMEOUT);
-  while (HAL_SPI_GetState(_LoRa->hSPIx) != HAL_SPI_STATE_READY)
-    ;
+  while (HAL_SPI_GetState(_LoRa->hSPIx) != HAL_SPI_STATE_READY);
   HAL_GPIO_WritePin(_LoRa->CS_port, _LoRa->CS_pin, GPIO_PIN_SET);
 }
 

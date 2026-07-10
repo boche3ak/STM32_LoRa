@@ -605,6 +605,7 @@ static void ChallengerTestLoop(void) {
       PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
       HAL_Delay(50u);
     } else {
+      LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
       Dbg_PingRxCount++;
       uint8_t match = 1u;
       for(uint8_t i = 0u; i < TEST_PING_LEN; i++){
@@ -640,10 +641,11 @@ static void ChallengerTestLoop(void) {
 static void TransponderTestLoop(void) {
   PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
   LoRa_startReceiving(&loRa);
-
+  uint8_t ledState = GPIO_PIN_RESET;
   while(stayActive){
     if(loRaRxReady){
       loRaRxReady = 0u;
+      LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
       Dbg_PingRxCount++;
 
       for(uint8_t i = 0u; i < TEST_PING_LEN; i++){
@@ -670,6 +672,7 @@ static void TransponderTestLoop(void) {
     UpdateModemStatusDebug();
     UpdateIrqFlagsDebug();
     HAL_Delay(WATCHDOG_SAFE_POLL_MS(Cfg_TransponderMainCycleMs));
+    PIN_WRITE_STAT_POWERON(ledState^=1u); /* toggle LED to indicate the transponder is alive */
     WATCHDOG_REFRESH();
   }//while stay active ** Transponder test ping loop **
 }
@@ -742,6 +745,7 @@ static void ChallengerLoop(void) {
         uint32_t roundTripMs   = HAL_GetTick() - txTimestamp;
         uint32_t echoCounter   = 0u;
         uint32_t transponderTs = 0u;
+        LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
 
         if(DecodeResponsePackage(RxBuffer, RESPONSE_PACKET_LEN,
                                  &echoCounter, &transponderTs) == OK
@@ -776,6 +780,7 @@ static void TransponderLoop(void) {
     if(loRaRxReady){
       uint32_t rxTimestamp = HAL_GetTick(); /* capture arrival time before any processing */
       loRaRxReady = 0u;
+      LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
 
       uint32_t echoCounter = 0u;
       if(DecodeChallengePackage(RxBuffer, CHALLENGE_PACKET_LEN, &echoCounter) == OK){
@@ -919,7 +924,6 @@ void SystemClock_Config(void)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == DIO0_Pin) {
-    LoRa_receive(&loRa, RxBuffer, 128);
     loRaRxReady = 1u;
     Dbg_IrqGeneriFire++;
   }
