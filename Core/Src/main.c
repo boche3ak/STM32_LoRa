@@ -69,6 +69,18 @@ enum {
 #define STAT_FOE                        GPIO_PIN_RESET
 
 
+/* ---------------------------------------------------------------------------
+ * Test ping mode
+ *
+ * Uncomment TEST_PING_MODE to replace the cryptographic challenge-response
+ * protocol with a plain connectivity test: the Challenger transmits a fixed
+ * 4-byte telegram, the Transponder replies with the same bytes inverted.
+ * The Challenger stores the reply in the Dbg_Ping* variables for inspection
+ * in the debugger; no pin indication logic is involved.
+ * ---------------------------------------------------------------------------*/
+//#define TEST_PING_MODE
+#define TEST_PING_LEN                  4u
+
 /* predefined parameters*/
 #define TXRX_BUFFER_MAX_LENGTH        128u
 #define MAGIC_PATTERN_LEN              4u
@@ -98,6 +110,12 @@ enum {
   #define WATCHDOG_REFRESH()           ((void)0)
 #endif
 
+/* Clamp a poll/pause chunk so it never exceeds 1/10 of the watchdog window.
+ * Short watchdog timeout -> chunk shrinks automatically (no manual checkups);
+ * long watchdog timeout  -> chunk stays at the desired value instead of growing. */
+#define WATCHDOG_SAFE_POLL_MS(desired)  ((desired) < (Cfg_WatchdogTimeoutMs / 10u) \
+                                          ? (desired) : (Cfg_WatchdogTimeoutMs / 10u))
+
 /* Private variables ---------------------------------------------------------*/
 LoRa loRa;
 uint8_t TxBuffer[TXRX_BUFFER_MAX_LENGTH];
@@ -124,6 +142,21 @@ static volatile uint8_t Dbg_IrqTxDone            = 0u;
 static volatile uint8_t Dbg_IrqCadDone           = 0u;
 static volatile uint8_t Dbg_IrqFhssChangeChannel = 0u;
 static volatile uint8_t Dbg_IrqCadDetected       = 0u;
+static volatile uint32_t Dbg_IrqGeneriFire       = 0u; /* counter for entering in the EXTI1 IRQ handler */
+
+#ifdef TEST_PING_MODE
+/* Fixed test telegram with distinctive mixed bit patterns.
+ * Expected inverted reply: 0x5A 0xA5 0x3C 0xC3 */
+static const uint8_t Test_Ping_Telegram[TEST_PING_LEN] = { 0xA5, 0x5A, 0xC3, 0x3C };
+
+/* Debug: test ping observability, watch in the debugger.
+ * Challenger side: response bytes, counters, match flag.
+ * Transponder side: received telegram bytes, reply counter. */
+static volatile uint8_t  Dbg_PingRxData[TEST_PING_LEN] = { 0u };
+static volatile uint32_t Dbg_PingTxCount   = 0u; /* telegrams / replies sent */
+static volatile uint32_t Dbg_PingRxCount   = 0u; /* packets received */
+static volatile uint8_t  Dbg_PingRxMatch   = 0u; /* 1 = last reply was the correctly inverted telegram (Challenger only) */
+#endif
 
 #ifdef WATCHDOG_ENABLED
 static IWDG_HandleTypeDef hiwdg;
@@ -141,11 +174,29 @@ __attribute__((section(".fof_config")))
 const uint32_t Cfg_TxTimeoutMs = 500u;
 
 /**
- * @brief Main loop cycle period in microseconds.
+ * @brief Main loop cycle period in milliseconds (Transponder poll rate).
  *        Located in .fof_config for field configurability.
  */
 __attribute__((section(".fof_config")))
-const uint32_t Cfg_MainCycleDelayUs = 2000u;
+const uint32_t Cfg_TransponderMainCycleMs = 2u;//2 ms
+
+/**
+ * @brief Challenger repetition cycle in milliseconds: pause between the end of
+ *        one challenge exchange and the start of the next. The Transponder is
+ *        purely reactive and keeps polling at Cfg_ChallengerMainCycleMs.
+ *        Located in .fof_config for field configurability.
+ */
+__attribute__((section(".fof_config")))
+const uint32_t Cfg_ChallengerMainCycleMs = 1000u;
+
+/**
+ * @brief Poll granularity in milliseconds while the Challenger waits for the
+ *        response. Bounds both the reaction latency to loRaRxReady and the
+ *        quantization error added to the measured round-trip time.
+ *        Located in .fof_config for field configurability.
+ */
+__attribute__((section(".fof_config")))
+const uint32_t Cfg_ResponseWaitCycleDelayMs = 10u;
 
 /**
  * @brief Maximum acceptable challenge–response round-trip time in milliseconds.
@@ -301,6 +352,7 @@ static void UpdateIrqFlagsDebug(void) {
   Dbg_IrqCadDetected       = (flags >> 0) & 0x01u;
 }
 
+#ifndef TEST_PING_MODE /* packet codecs are unused in test ping mode */
 /**
  * @brief  Encode a challenge packet into the transmit buffer.
  *
@@ -489,6 +541,302 @@ static uint8_t DecodeResponsePackage(uint8_t* buffer, uint16_t length,
                      ((uint32_t)buffer[MAGIC_PATTERN_LEN + 7u]);
   return OK;
 }
+#endif /* !TEST_PING_MODE */
+
+/**
+ * @brief Pause between two challenge exchanges (Challenger only).
+ *
+ * @details Waits Cfg_ChallengerMainCycleMs in chunks of at most 1/10 of the
+ *          watchdog window (capped at 100 ms), feeding the watchdog after each
+ *          chunk. A shorter provisioned watchdog timeout shrinks the chunks
+ *          automatically; a longer one does not slow the pause granularity.
+ */
+static void ChallengerCyclePause(void) {
+  uint32_t start = HAL_GetTick();
+  while((HAL_GetTick() - start) < Cfg_ChallengerMainCycleMs){
+    HAL_Delay(WATCHDOG_SAFE_POLL_MS(100u));
+    WATCHDOG_REFRESH();
+  }
+}
+
+#ifdef TEST_PING_MODE
+
+/**
+ * @brief Challenger connectivity-test loop (TEST_PING_MODE). Never returns.
+ *
+ * @details Transmits the fixed test telegram, then waits up to 1 s for the
+ *          Transponder's reply. A reply matching the bitwise-inverted telegram
+ *          is indicated by a short negative LED blink; all observability data
+ *          lands in the Dbg_Ping* variables.
+ */
+static void ChallengerTestLoop(void) {
+// # 1 Preparation
+//   empty in the test scenario
+  while(stayActive){
+
+
+    // # 2 Prepare the message
+    memcpy(TxBuffer, Test_Ping_Telegram, TEST_PING_LEN);
+
+
+    // # 3 Transmit the challenge and start rx listening
+    PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);// toggle TX (on)
+    LoRa_transmit(&loRa, TxBuffer, TEST_PING_LEN, Cfg_TxTimeoutMs);
+    Dbg_PingTxCount++;
+
+    loRaRxReady = 0u;
+    LoRa_startReceiving(&loRa);
+    uint32_t rxStart = HAL_GetTick();
+    /* Response window = half the repetition cycle, so a timed-out exchange
+     * (wait + pause) never exceeds 1.5x Cfg_ChallengerMainCycleMs. */
+    while((HAL_GetTick() - rxStart) < (Cfg_ChallengerMainCycleMs / 2u) && !loRaRxReady){
+      HAL_Delay(WATCHDOG_SAFE_POLL_MS(Cfg_ResponseWaitCycleDelayMs));
+      WATCHDOG_REFRESH();
+    }
+
+    PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);// Toggle TX (off)
+    if(!loRaRxReady){
+      PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);/* timeout — no reply or foe */
+      HAL_Delay(50u);
+      PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+      HAL_Delay(50u);
+      PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+      HAL_Delay(50u);
+      PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+      HAL_Delay(50u);
+    } else {
+      LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
+      Dbg_PingRxCount++;
+      uint8_t match = 1u;
+      for(uint8_t i = 0u; i < TEST_PING_LEN; i++){
+        Dbg_PingRxData[i] = RxBuffer[i];
+        if(RxBuffer[i] != (uint8_t)~Test_Ping_Telegram[i]){
+          match = 0u;
+        }
+      }
+      if(match == 1u)
+      {
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);// indicate RX
+        HAL_Delay(100u);
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);// indicate RX
+        HAL_Delay(100u);
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);// indicate RX
+      }
+      Dbg_PingRxMatch = match;
+    }
+
+    UpdateModemStatusDebug();
+    UpdateIrqFlagsDebug();
+    ChallengerCyclePause();
+  }//while stay active ** Challenger test ping loop **
+}
+
+/**
+ * @brief Transponder connectivity-test loop (TEST_PING_MODE). Never returns.
+ *
+ * @details Listens silently; on any received packet, replies with its first
+ *          TEST_PING_LEN bytes bitwise-inverted, then indicates the exchange
+ *          with a triple negative LED flash before returning to listen mode.
+ */
+static void TransponderTestLoop(void) {
+  PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+  LoRa_startReceiving(&loRa);
+  uint8_t ledState = GPIO_PIN_RESET;
+  while(stayActive){
+    if(loRaRxReady){
+      loRaRxReady = 0u;
+      /* reply only to complete, CRC-clean frames */
+      if(LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH) < TEST_PING_LEN){
+        continue;
+      }
+      Dbg_PingRxCount++;
+
+      for(uint8_t i = 0u; i < TEST_PING_LEN; i++){
+        Dbg_PingRxData[i] = RxBuffer[i];
+        TxBuffer[i] = (uint8_t)~RxBuffer[i];
+      }
+      //little delay to avoid collision with the end of the reception
+      HAL_Delay(10u);
+
+      LoRa_transmit(&loRa, TxBuffer, TEST_PING_LEN, Cfg_TxTimeoutMs);
+      Dbg_PingTxCount++;
+      LoRa_startReceiving(&loRa); /* return to silent listen after reply */
+
+      /* Negative-flash 3x to indicate a telegram was received, inverted and
+       * sent back. The LED is normally lit while receiving (PC13: RESET = on),
+       * so each flash is a short dark pulse: SET = off, RESET = back on. */
+      for(uint8_t i = 0u; i < 3u; i++){
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);   /* dark pulse */
+        HAL_Delay(50u);
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET); /* back to lit */
+        HAL_Delay(50u);
+        WATCHDOG_REFRESH();
+      }
+    }
+
+    UpdateModemStatusDebug();
+    UpdateIrqFlagsDebug();
+    HAL_Delay(WATCHDOG_SAFE_POLL_MS(Cfg_TransponderMainCycleMs));
+    PIN_WRITE_STAT_POWERON(ledState^=1u); /* toggle LED to indicate the transponder is alive */
+    WATCHDOG_REFRESH();
+  }//while stay active ** Transponder test ping loop **
+}
+
+#else /* !TEST_PING_MODE */
+
+/**
+ * @brief Compute the ECDH shared secret into Computed_Secret.
+ *
+ * @details One-time key agreement over SECP256R1 using the provisioned
+ *          Private_Key and Remote_Public_Key. Executed once before entering
+ *          the protocol loop; both Challenger and Transponder derive the same
+ *          secret, which keys the HMAC of every packet.
+ */
+static void ComputeSharedSecret(void) {
+  size_t secretLen = 0u;
+  cmox_ecc_construct(&Ecc_Ctx, CMOX_MATH_FUNCS_SMALL, Working_Buffer, sizeof(Working_Buffer));
+  cmox_ecdh(&Ecc_Ctx, CMOX_ECC_SECP256R1_LOWMEM,
+            Private_Key,       sizeof(Private_Key),
+            Remote_Public_Key, sizeof(Remote_Public_Key),
+            Computed_Secret,   &secretLen);
+  cmox_ecc_cleanup(&Ecc_Ctx);
+}
+
+/**
+ * @brief Challenger protocol loop. Never returns.
+ *
+ * @details Periodically transmits an HMAC-authenticated challenge and waits
+ *          up to 1 s for the response. STAT_FRIEND is signalled only when the
+ *          response passes HMAC verification, echoes the sent counter, and
+ *          arrives within Cfg_ResponseDelayToleranceMs; any other outcome
+ *          (timeout, bad HMAC, stale counter, excessive delay) signals STAT_FOE.
+ */
+static void ChallengerLoop(void) {
+// # 1 Preparation
+  ComputeSharedSecret();
+
+  while(stayActive){
+
+
+    // # 2 Prepare the message
+    if(EncodeChallengePackage(TxBuffer, TXRX_BUFFER_MAX_LENGTH) == OK){
+      /* Read back the counter we just packed so we can validate the echo */
+      uint32_t sentCounter = ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 0u] << 24) |
+                             ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 1u] << 16) |
+                             ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 2u] <<  8) |
+                             ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 3u]);
+
+      uint32_t txTimestamp = HAL_GetTick();
+
+
+      // # 3 Transmit the challenge and start rx listening
+      PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);// toggle TX (on)
+      LoRa_transmit(&loRa, TxBuffer, CHALLENGE_PACKET_LEN, Cfg_TxTimeoutMs);
+
+      loRaRxReady = 0u;
+      LoRa_startReceiving(&loRa);
+      uint32_t rxStart = HAL_GetTick();
+      /* Response window = half the repetition cycle, so a timed-out exchange
+       * (wait + pause) never exceeds 1.5x Cfg_ChallengerMainCycleMs. */
+      while((HAL_GetTick() - rxStart) < (Cfg_ChallengerMainCycleMs / 2u) && !loRaRxReady){
+        HAL_Delay(WATCHDOG_SAFE_POLL_MS(Cfg_ResponseWaitCycleDelayMs));
+        WATCHDOG_REFRESH();
+      }
+
+      PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);// Toggle TX (off)
+      if(!loRaRxReady){
+        PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* timeout — no reply or foe */
+        /* LED indication: double blink on timeout (test-style, to be replaced) */
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+        HAL_Delay(50u);
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+        HAL_Delay(50u);
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+        HAL_Delay(50u);
+        PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+        HAL_Delay(50u);
+      } else {
+        uint32_t roundTripMs   = HAL_GetTick() - txTimestamp;
+        uint32_t echoCounter   = 0u;
+        uint32_t transponderTs = 0u;
+        uint8_t  rxLen = LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
+
+        if(rxLen >= RESPONSE_PACKET_LEN
+           && DecodeResponsePackage(RxBuffer, RESPONSE_PACKET_LEN,
+                                    &echoCounter, &transponderTs) == OK
+           && echoCounter == sentCounter
+           && roundTripMs <= Cfg_ResponseDelayToleranceMs){
+          PIN_WRITE_STAT_FRIEND_FOF(STAT_FRIEND);
+          /* LED indication: friend confirmed (test-style, to be replaced) */
+          PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+          HAL_Delay(100u);
+          PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+          HAL_Delay(100u);
+          PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+        } else {
+          PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* bad HMAC, counter mismatch, or delay exceeded */
+        }
+      }
+    }
+    UpdateModemStatusDebug();
+    UpdateIrqFlagsDebug();
+    ChallengerCyclePause();
+  }//while stay active ** Challenger main loop **
+}
+
+/**
+ * @brief Transponder protocol loop. Never returns.
+ *
+ * @details Listens silently (IRQ-driven reception). On a valid challenge
+ *          (magic + HMAC verified) it echoes the challenge counter together
+ *          with its local receive timestamp in an HMAC-authenticated response,
+ *          then returns to silent listening. Invalid packets are ignored.
+ */
+static void TransponderLoop(void) {
+  ComputeSharedSecret();
+
+  PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET); /* LED on: listening */
+  LoRa_startReceiving(&loRa); /* silent listen; reception is IRQ-driven */
+  uint8_t ledState = GPIO_PIN_RESET;
+
+  while(stayActive){
+    if(loRaRxReady){
+      uint32_t rxTimestamp = HAL_GetTick(); /* capture arrival time before any processing */
+      loRaRxReady = 0u;
+      /* process only complete, CRC-clean frames; skips HMAC work on noise */
+      if(LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH) < CHALLENGE_PACKET_LEN){
+        continue;
+      }
+
+      uint32_t echoCounter = 0u;
+      if(DecodeChallengePackage(RxBuffer, CHALLENGE_PACKET_LEN, &echoCounter) == OK){
+        if(EncodeResponsePackage(TxBuffer, TXRX_BUFFER_MAX_LENGTH, echoCounter, rxTimestamp) == OK){
+          /* little delay so the Challenger has completed its TX->RX turnaround */
+          HAL_Delay(10u);
+          LoRa_transmit(&loRa, TxBuffer, RESPONSE_PACKET_LEN, Cfg_TxTimeoutMs);
+          LoRa_startReceiving(&loRa); /* return to silent listen after reply */
+
+          /* LED indication: negative-flash 3x after a valid challenge was
+           * answered (test-style, to be replaced) */
+          for(uint8_t i = 0u; i < 3u; i++){
+            PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);   /* dark pulse */
+            HAL_Delay(50u);
+            PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET); /* back to lit */
+            HAL_Delay(50u);
+            WATCHDOG_REFRESH();
+          }
+        }
+      }
+    }
+    UpdateModemStatusDebug();
+    UpdateIrqFlagsDebug();
+    HAL_Delay(WATCHDOG_SAFE_POLL_MS(Cfg_TransponderMainCycleMs));
+    PIN_WRITE_STAT_POWERON(ledState^=1u); /* toggle LED to indicate the transponder is alive */
+    WATCHDOG_REFRESH();
+  }//while stay active ** Transponder main loop **
+}
+
+#endif /* TEST_PING_MODE */
 
 /**
   * @brief  The application entry point.
@@ -553,92 +901,23 @@ int main(void)
     FaultBlinkHalt();
   }
 
-  PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
-
-  /** main loop **/
+  /** main loop — never returns from the selected loop function **/
   switch(devType){
-    case Challenger: {
-      size_t secretLen = 0u;
-      cmox_ecc_construct(&Ecc_Ctx, CMOX_MATH_FUNCS_SMALL, Working_Buffer, sizeof(Working_Buffer));
-      cmox_ecdh(&Ecc_Ctx, CMOX_ECC_SECP256R1_LOWMEM,
-                Private_Key,       sizeof(Private_Key),
-                Remote_Public_Key, sizeof(Remote_Public_Key),
-                Computed_Secret,   &secretLen);
-      cmox_ecc_cleanup(&Ecc_Ctx);
+    case Challenger:
+#ifdef TEST_PING_MODE
+      ChallengerTestLoop();
+#else
+      ChallengerLoop();
+#endif
+      break;
+    case Transponder:
+#ifdef TEST_PING_MODE
+      TransponderTestLoop();
+#else
+      TransponderLoop();
+#endif
+      break;
 
-      while(stayActive){
-        if(EncodeChallengePackage(TxBuffer, TXRX_BUFFER_MAX_LENGTH) == OK){
-          /* Read back the counter we just packed so we can validate the echo */
-          uint32_t sentCounter = ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 0u] << 24) |
-                                 ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 1u] << 16) |
-                                 ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 2u] <<  8) |
-                                 ((uint32_t)TxBuffer[MAGIC_PATTERN_LEN + 3u]);
-
-          uint32_t txTimestamp = HAL_GetTick();
-          LoRa_transmit(&loRa, TxBuffer, CHALLENGE_PACKET_LEN, Cfg_TxTimeoutMs);
-
-          loRaRxReady = 0u;
-          LoRa_startReceiving(&loRa);
-          uint32_t rxStart = HAL_GetTick();
-          while((HAL_GetTick() - rxStart) < 1000u && !loRaRxReady){
-            delay_us_precise(Cfg_MainCycleDelayUs);
-            WATCHDOG_REFRESH();
-          }
-
-          if(!loRaRxReady){
-            PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* timeout — no reply or foe */
-          } else {
-            uint32_t roundTripMs   = HAL_GetTick() - txTimestamp;
-            uint32_t echoCounter   = 0u;
-            uint32_t transponderTs = 0u;
-
-            if(DecodeResponsePackage(RxBuffer, RESPONSE_PACKET_LEN,
-                                     &echoCounter, &transponderTs) == OK
-               && echoCounter == sentCounter
-               && roundTripMs <= Cfg_ResponseDelayToleranceMs){
-              PIN_WRITE_STAT_FRIEND_FOF(STAT_FRIEND);
-            } else {
-              PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* bad HMAC, counter mismatch, or delay exceeded */
-            }
-          }
-        }
-        UpdateModemStatusDebug();
-        UpdateIrqFlagsDebug();
-        delay_us_precise(Cfg_MainCycleDelayUs);
-        WATCHDOG_REFRESH();
-      }//while stay active ** Challenger main loop **
-    } break;
-
-    case Transponder: {
-      size_t secretLen = 0u;
-      cmox_ecc_construct(&Ecc_Ctx, CMOX_MATH_FUNCS_SMALL, Working_Buffer, sizeof(Working_Buffer));
-      cmox_ecdh(&Ecc_Ctx, CMOX_ECC_SECP256R1_LOWMEM,
-                Private_Key,       sizeof(Private_Key),
-                Remote_Public_Key, sizeof(Remote_Public_Key),
-                Computed_Secret,   &secretLen);
-      cmox_ecc_cleanup(&Ecc_Ctx);
-
-      LoRa_startReceiving(&loRa); /* silent listen; reception is IRQ-driven */
-
-      while(stayActive){
-        if(loRaRxReady){
-          uint32_t rxTimestamp = HAL_GetTick(); /* capture arrival time before any processing */
-          loRaRxReady = 0u;
-
-          uint32_t echoCounter = 0u;
-          if(DecodeChallengePackage(RxBuffer, CHALLENGE_PACKET_LEN, &echoCounter) == OK){
-            if(EncodeResponsePackage(TxBuffer, TXRX_BUFFER_MAX_LENGTH, echoCounter, rxTimestamp) == OK){
-              LoRa_transmit(&loRa, TxBuffer, RESPONSE_PACKET_LEN, Cfg_TxTimeoutMs);
-              LoRa_startReceiving(&loRa); /* return to silent listen after reply */
-            }
-          }
-        }
-        UpdateModemStatusDebug();
-        UpdateIrqFlagsDebug();
-        delay_us_precise(Cfg_MainCycleDelayUs);
-        WATCHDOG_REFRESH();
-      }//while stay active ** Transponder main loop **
-    } break;
     default:
       //this branch shall be never reached - error case
       Error_Handler();
@@ -684,8 +963,8 @@ void SystemClock_Config(void)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == DIO0_Pin) {
-    LoRa_receive(&loRa, RxBuffer, 128);
     loRaRxReady = 1u;
+    Dbg_IrqGeneriFire++;
   }
 }
 

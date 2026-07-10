@@ -105,11 +105,9 @@ void LoRa_gotoMode(LoRa* _LoRa, int mode){
 void LoRa_readReg(LoRa* _LoRa, uint8_t* address, uint16_t r_length, uint8_t* output, uint16_t w_length){
   HAL_GPIO_WritePin(_LoRa->CS_port, _LoRa->CS_pin, GPIO_PIN_RESET);
   HAL_SPI_Transmit(_LoRa->hSPIx, address, r_length, TRANSMIT_TIMEOUT);
-  while (HAL_SPI_GetState(_LoRa->hSPIx) != HAL_SPI_STATE_READY)
-    ;
+  while (HAL_SPI_GetState(_LoRa->hSPIx) != HAL_SPI_STATE_READY);
   HAL_SPI_Receive(_LoRa->hSPIx, output, w_length, RECEIVE_TIMEOUT);
-  while (HAL_SPI_GetState(_LoRa->hSPIx) != HAL_SPI_STATE_READY)
-    ;
+  while (HAL_SPI_GetState(_LoRa->hSPIx) != HAL_SPI_STATE_READY);
   HAL_GPIO_WritePin(_LoRa->CS_port, _LoRa->CS_pin, GPIO_PIN_SET);
 }
 
@@ -520,8 +518,12 @@ uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint8_t length){
 
   LoRa_gotoMode(_LoRa, STNBY_MODE);
   read = LoRa_read(_LoRa, RegIrqFlags);
-  if((read & 0x40) != 0){
-    LoRa_write(_LoRa, RegIrqFlags, 0xFF);
+  /* Always clear the IRQ flags, even for rejected frames - otherwise DIO0
+   * stays latched high and the (rising-edge) EXTI never fires again. */
+  LoRa_write(_LoRa, RegIrqFlags, 0xFF);
+  /* Accept only frames with RxDone set AND PayloadCrcError clear;
+   * a corrupted payload returns 0 bytes as if nothing was received. */
+  if(((read & 0x40) != 0) && ((read & 0x20) == 0)){
     number_of_bytes = LoRa_read(_LoRa, RegRxNbBytes);
     read = LoRa_read(_LoRa, RegFiFoRxCurrentAddr);
     LoRa_write(_LoRa, RegFiFoAddPtr, read);
@@ -530,7 +532,7 @@ uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint8_t length){
       data[i] = LoRa_read(_LoRa, RegFiFo);
   }
   LoRa_gotoMode(_LoRa, RXCONTIN_MODE);
-    return min;
+  return min;
 }
 
 /* ----------------------------------------------------------------------------- *\
