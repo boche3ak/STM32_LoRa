@@ -283,9 +283,13 @@ class ActiveSession:
                 except Exception:
                     break
 
-    def send(self, data: bytes) -> None:
-        """Write bytes exclusively — ping is blocked for the duration."""
+    def send(self, data: bytes, *, flush_rx: bool = False) -> None:
+        """Write bytes exclusively — ping is blocked for the duration.
+        flush_rx=True discards stale incoming bytes before writing, inside the
+        same lock window so no ping can arrive between the flush and the write."""
         with self._lock:
+            if flush_rx:
+                self.ser.reset_input_buffer()
             self.ser.write(data)
             self.ser.flush()
 
@@ -389,7 +393,9 @@ class ProvSession:
         for attempt in range(1, self.max_retries + 1):
             if attempt > 1:
                 self._log(yellow(f"Retry {attempt}/{self.max_retries}…"))
-            self._conn.send(packet)
+            # Flush RX before every attempt — on timeout retries, delayed bytes
+            # from the previous attempt may still be arriving.
+            self._conn.send(packet, flush_rx=True)
             self._sent += 1
             resp = self._recv(timeout=self.byte_timeout)
             if resp is None:
@@ -410,19 +416,23 @@ class ProvSession:
     # ── Get config ────────────────────────────────────────────────────────────
 
     def _recv_packet_from_sof(self) -> Optional[Tuple[int, bytes]]:
+        """Read TYPE+LEN+PAYLOAD+CRC after SOF has already been consumed."""
         frame = bytearray([PROV_SOF])
-        for _ in range(2):
+        for _ in range(2):          # TYPE, LEN
             b = self._recv(self.byte_timeout)
             if b is None:
                 return None
             frame.append(b)
         pkt_len = frame[2]
-        for _ in range(pkt_len):
+        if pkt_len > 64:            # sanity: largest known payload is 64 B (pubkey)
+            self._log(red(f"LEN={pkt_len} > 64 — framing error, aborting"))
+            return None
+        for _ in range(pkt_len):    # PAYLOAD
             b = self._recv(self.byte_timeout)
             if b is None:
                 return None
             frame.append(b)
-        for _ in range(2):
+        for _ in range(2):          # CRC HI, LO
             b = self._recv(self.byte_timeout)
             if b is None:
                 return None
@@ -433,35 +443,56 @@ class ProvSession:
         """
         Send a GET_CONFIG request and return the device config dict.
         Returns None on error or if the device does not support the command.
+
+        Retries up to max_retries times.  Before each attempt the RX buffer is
+        flushed (inside the send lock) so stale bytes from earlier operations —
+        e.g. extra READY signals or partial responses — cannot corrupt the read.
         """
         packet = build_packet(PKT_GET_CONFIG, b"")
         print(f"\n  {bold('▸  GET_CONFIG request')}")
         if self.verbose:
             _hex_dump("Packet", packet)
-        self._conn.send(packet)
 
-        resp = self._recv(timeout=self.byte_timeout)
-        if resp is None:
-            self._log(red("Timeout — no response from device"))
-            return None
+        for attempt in range(1, self.max_retries + 1):
+            if attempt > 1:
+                self._log(yellow(f"Retry {attempt}/{self.max_retries}…"))
 
-        if resp in (PROV_RJCT, PROV_NAK):
-            print(f"\n  {red('✗')}  This device doesn't support reading out the configuration.")
-            return None
+            # flush_rx=True clears stale bytes atomically with the write
+            self._conn.send(packet, flush_rx=True)
 
-        if resp == PROV_SOF:
+            # Scan for SOF, tolerating up to 3 leading stale bytes
+            resp = None
+            for _ in range(4):
+                resp = self._recv(timeout=self.byte_timeout)
+                if resp is None:
+                    self._log(yellow(f"No response (attempt {attempt})"))
+                    break
+                if resp in (PROV_RJCT, PROV_NAK):
+                    print(f"\n  {red('✗')}  "
+                          "This device doesn't support reading out the configuration.")
+                    return None
+                if resp == PROV_SOF:
+                    break
+                self._log(yellow(f"Skipping stale byte 0x{resp:02X}"))
+
+            if resp != PROV_SOF:
+                continue  # retry
+
             result = self._recv_packet_from_sof()
             if result is None:
-                self._log(red("Timeout reading response packet"))
-                return None
+                self._log(yellow(f"Incomplete response (attempt {attempt})"))
+                continue
             pkt_type, payload = result
             if pkt_type != PKT_CONFIG or len(payload) != CONFIG_LEN:
-                self._log(red(f"Unexpected response: type=0x{pkt_type:02X} len={len(payload)}"))
-                return None
+                self._log(yellow(
+                    f"Unexpected response type=0x{pkt_type:02X} len={len(payload)}"
+                    f" (attempt {attempt})"))
+                continue
+
             self._log(green("Configuration received  ✓"))
             return _unpack_config(payload)
 
-        self._log(yellow(f"Unexpected response 0x{resp:02X}"))
+        self._log(red(f"GET_CONFIG failed after {self.max_retries} attempts."))
         return None
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -530,6 +561,12 @@ def ensure_connected(settings: Settings) -> bool:
     if not prov.wait_for_ready(timeout=settings["wait_timeout"]):
         conn.close(commit=False)
         return False
+
+    # Flush any extra READY bytes the device may have sent while the Pi was
+    # starting up.  wait_for_ready consumes exactly one READY and returns; any
+    # additional 0xAA bytes left in the OS buffer would be read as the first
+    # byte of the next response and corrupt it.
+    ser.reset_input_buffer()
 
     conn.start_ping()
     _gs.conn = conn
