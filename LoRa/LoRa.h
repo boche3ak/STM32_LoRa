@@ -106,6 +106,7 @@ typedef struct LoRa_setting{
   uint16_t  preamble;
   uint8_t   power;
   uint8_t   overCurrentProtection;
+  uint8_t   lnaGain;   /* 0=AGC auto, 1=G1 (max sensitivity) … 6=G6 (min sensitivity) */
 
 } LoRa;
 
@@ -135,6 +136,7 @@ void LoRa_setAutoLDO(LoRa* _LoRa);
 void LoRa_setFrequency(LoRa* _LoRa, int freq);
 void LoRa_setSpreadingFactor(LoRa* _LoRa, int SP);
 void LoRa_setPower(LoRa* _LoRa, uint8_t power);
+void LoRa_setPowerDbm(LoRa* _LoRa, uint8_t dBm);
 void LoRa_setOCP(LoRa* _LoRa, uint8_t current);
 void LoRa_setLnaGain(LoRa* _LoRa, uint8_t gainStep);
 void LoRa_setTOMsb_setCRCon(LoRa* _LoRa);

@@ -27,6 +27,7 @@ LoRa newLoRa(){
   new_LoRa.power                 = POWER_11db;
   new_LoRa.overCurrentProtection = 100       ;
   new_LoRa.preamble              = 8         ;
+  new_LoRa.lnaGain               = 1u        ; /* G1 = maximum sensitivity */
 
   return new_LoRa;
 }
@@ -258,6 +259,29 @@ void LoRa_setPower(LoRa* _LoRa, uint8_t power){
 }
 
 /* ----------------------------------------------------------------------------- *\
+    name        : LoRa_setPowerDbm
+
+    description : set output power in dBm using the PA_BOOST pin path.
+                  Converts dBm to the raw RegPaConfig byte via the formula
+                  RegPaConfig = 0xF0 | (dBm - 5), consistent with the POWER_xxdb
+                  constants defined in this header.  Updates _LoRa->power so the
+                  value survives a future LoRa_init() call.
+                  Valid dBm range: 5..20.  Values outside this range are clamped.
+
+    arguments   :
+      LoRa*   _LoRa  --> LoRa object handler
+      uint8_t dBm    --> desired output power in dBm (5..20)
+
+    returns     : Nothing
+\* ----------------------------------------------------------------------------- */
+void LoRa_setPowerDbm(LoRa* _LoRa, uint8_t dBm){
+  if(dBm < 5u)  dBm = 5u;
+  if(dBm > 20u) dBm = 20u;
+  _LoRa->power = 0xF0u | (uint8_t)(dBm - 5u);
+  LoRa_setPower(_LoRa, _LoRa->power);
+}
+
+/* ----------------------------------------------------------------------------- *\
     name        : LoRa_setOCP
 
     description : set maximum allowed current.
@@ -289,28 +313,39 @@ void LoRa_setOCP(LoRa* _LoRa, uint8_t current){
 /* ----------------------------------------------------------------------------- *\
     name        : LoRa_setLnaGain
 
-    description : set LNA gain step G1..G6 per the datasheet (RegLna bits 7-5).
-                  G1 = highest gain (0 dB attenuation)
-                  G2 - HG-6dB,
-                  G3 = HG-12dB,
-                  G4 = HG-24dB,
-                  G5 = HG-32dB,
-                  G6 = highest gain - 48 dB.
+    description : set LNA gain step G1..G6 per the datasheet (RegLna bits 7-5),
+                  or enable AGC automatic gain control.
+
+                  gainStep = 0 : AGC auto — sets AgcAutoOn (RegModemConfig3 bit 2);
+                                 hardware overrides RegLna.LnaGain dynamically.
+                  gainStep = 1 : G1 = highest gain (0 dB attenuation, most sensitive)
+                  gainStep = 2 : G2 = HG-6 dB
+                  gainStep = 3 : G3 = HG-12 dB
+                  gainStep = 4 : G4 = HG-24 dB
+                  gainStep = 5 : G5 = HG-32 dB
+                  gainStep = 6 : G6 = HG-48 dB (least sensitive)
+                  values > 6 are clamped to 6.
+
                   LnaBoostLf is forced to its default value (00); this driver only
                   operates below 525 MHz, where LnaBoostHf (RFI_HF path) has no effect.
 
     arguments   :
-      LoRa*   LoRa      --> LoRa object handler
-      uint8_t gainStep  --> desired gain step, 1 (highest gain) .. 6 (lowest gain)
-                            values outside [1,6] are clamped
+      LoRa*   _LoRa     --> LoRa object handler
+      uint8_t gainStep  --> 0 = AGC auto, 1 (max) .. 6 (min); values > 6 clamped to 6
 
     returns     : Nothing
 \* ----------------------------------------------------------------------------- */
 void LoRa_setLnaGain(LoRa* _LoRa, uint8_t gainStep){
-  if(gainStep < 1u) gainStep = 1u;
-  if(gainStep > 6u) gainStep = 6u;
-
-  LoRa_write(_LoRa, RegLna, (gainStep << 5));
+  uint8_t mc3 = LoRa_read(_LoRa, RegModemConfig3);
+  if(gainStep == 0u){
+    /* AGC auto: AgcAutoOn (bit 2) = 1; hardware ignores RegLna.LnaGain */
+    LoRa_write(_LoRa, RegModemConfig3, mc3 | 0x04u);
+  } else {
+    if(gainStep > 6u) gainStep = 6u;
+    /* Fixed gain: disable AGC, write explicit gain step to RegLna */
+    LoRa_write(_LoRa, RegModemConfig3, mc3 & (uint8_t)~0x04u);
+    LoRa_write(_LoRa, RegLna, (uint8_t)(gainStep << 5u));
+  }
 }
 
 /* ----------------------------------------------------------------------------- *\
@@ -637,8 +672,8 @@ uint16_t LoRa_init(LoRa* _LoRa){
     // set over current protection:
       LoRa_setOCP(_LoRa, _LoRa->overCurrentProtection);
 
-    // set LNA gain: G6 (highest gain - 48dB), default LnaBoostLf current (433 MHz uses the LF input path)
-      LoRa_setLnaGain(_LoRa, 6u);
+    // set LNA gain from struct field (0=AGC, 1=G1 max .. 6=G6 min)
+      LoRa_setLnaGain(_LoRa, _LoRa->lnaGain);
 
     // set spreading factor, CRC on, and Timeout Msb:
       LoRa_setTOMsb_setCRCon(_LoRa);

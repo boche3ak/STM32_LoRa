@@ -25,7 +25,7 @@
 #define NVRAM_SIZE         1024u
 #define NVRAM_PRIVKEY_OFF  4u    /* 32 bytes after 4-byte magic */
 #define NVRAM_PUBKEY_OFF   36u   /* 64 bytes                     */
-#define NVRAM_CONFIG_OFF   100u  /* 24 bytes = 6 × uint32_t      */
+#define NVRAM_CONFIG_OFF   100u  /* 32 bytes = 8 × uint32_t      */
 
 /* ============================================================================
  * Timing

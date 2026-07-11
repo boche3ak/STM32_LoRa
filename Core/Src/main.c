@@ -213,6 +213,24 @@ const uint32_t Cfg_ResponseDelayToleranceMs = 500u;
 __attribute__((section(".fof_config")))
 const uint32_t Cfg_WatchdogTimeoutMs = 1000u;
 
+/**
+ * @brief LoRa TX output power in dBm via PA_BOOST pin (5..20 dBm).
+ *        Applied to the SX1278 RegPaConfig register before LoRa_init().
+ *        Formula: RegPaConfig = 0xF0 | (Cfg_TxPowerDbm - 5).
+ *        Located in .fof_config for field configurability.
+ */
+__attribute__((section(".fof_config")))
+const uint32_t Cfg_TxPowerDbm = 14u;
+
+/**
+ * @brief LNA gain setting for the SX1278 receiver.
+ *        0 = AGC automatic (hardware selects gain dynamically).
+ *        1 = G1 maximum sensitivity … 6 = G6 minimum sensitivity.
+ *        Located in .fof_config for field configurability.
+ */
+__attribute__((section(".fof_config")))
+const uint32_t Cfg_LnaGain = 1u;
+
 /* Computed data buffer */
 uint8_t Computed_Secret[CMOX_ECC_SECP256R1_SECRET_LEN];
 
@@ -894,6 +912,12 @@ int main(void)
   loRa.DIO0_port       = DIO0_GPIO_Port;
   loRa.DIO0_pin        = DIO0_Pin;
   loRa.hSPIx           = &hspi1;
+
+  /* Apply NVRAM-provisioned RF parameters; guard against unprogrammed flash (0xFF…). */
+  if (Cfg_TxPowerDbm >= 5u && Cfg_TxPowerDbm <= 20u)
+    loRa.power   = 0xF0u | (uint8_t)(Cfg_TxPowerDbm - 5u);
+  if (Cfg_LnaGain <= 6u)
+    loRa.lnaGain = (uint8_t)Cfg_LnaGain;
 
   int returnCode = LoRa_init(&loRa);
 

@@ -32,13 +32,15 @@
   * Packet types and payload sizes:
   *   PROV_TYPE_PRIVKEY  0xB1  32 bytes  — SECP256R1 private key scalar
   *   PROV_TYPE_PUBKEY   0xB2  64 bytes  — SECP256R1 public key (x||y uncompressed)
-  *   PROV_TYPE_CONFIG   0xB3  24 bytes  — 6 × uint32_t little-endian:
+  *   PROV_TYPE_CONFIG   0xB3  32 bytes  — 8 × uint32_t little-endian:
   *                                         [0] TxTimeoutMs
   *                                         [1] TransponderMainCycleMs
   *                                         [2] ChallengerMainCycleMs
   *                                         [3] ResponseWaitCycleDelayMs
   *                                         [4] ResponseDelayToleranceMs
   *                                         [5] WatchdogTimeoutMs
+  *                                         [6] TxPowerDbm
+  *                                         [7] LnaGain
   *   PROV_GET_CONFIG    0xB4   0 bytes  — query: read back current NVRAM config
   *                                         device replies with a PROV_TYPE_CONFIG packet
   *   PROV_GET_PRIVKEY   0xB5   0 bytes  — query: read back stored private key
@@ -52,7 +54,7 @@
   * Packet sizes (total bytes on wire):
   *   Private key  : 1+1+1+32+2 = 37 bytes  (~38 ms @ 9600 baud)
   *   Public key   : 1+1+1+64+2 = 69 bytes  (~72 ms @ 9600 baud)
-  *   Config write : 1+1+1+24+2 = 29 bytes  (~30 ms @ 9600 baud)
+  *   Config write : 1+1+1+32+2 = 37 bytes  (~38 ms @ 9600 baud)
   *   Get config   : 1+1+1+ 0+2 =  5 bytes  (< 1 ms @ 9600 baud)
   *   Get privkey  : 1+1+1+ 0+2 =  5 bytes  (< 1 ms @ 9600 baud)
   *   Get pubkey   : 1+1+1+ 0+2 =  5 bytes  (< 1 ms @ 9600 baud)
@@ -112,7 +114,7 @@ extern "C" {
 /* Payload lengths (bytes) */
 #define PROV_PRIVKEY_LEN    32u
 #define PROV_PUBKEY_LEN     64u
-#define PROV_CONFIG_LEN     24u   /* 6 × uint32_t */
+#define PROV_CONFIG_LEN     32u   /* 8 × uint32_t */
 
 typedef enum {
     UART_PROV_NO_COUNTERPART = 0, /* no counterpart detected — normal cold start */

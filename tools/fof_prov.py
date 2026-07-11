@@ -32,6 +32,7 @@ Dependencies:
 
 import sys
 import os
+import io
 import json
 import copy
 import time
@@ -68,28 +69,30 @@ PKT_GET_PUBKEY   = 0xB6   # query: read back stored pubkey   (0 B payload)
 
 PRIVKEY_LEN = 32
 PUBKEY_LEN  = 64
-CONFIG_LEN  = 24    # 6 × uint32_t
+CONFIG_LEN  = 32    # 8 × uint32_t
 
 
 # ── Config field definitions (order matches NVRAM layout) ────────────────────
 
-CONFIG_FIELDS: List[Tuple[str, str, int]] = [
-    ("TxTimeoutMs",              "LoRa transmit timeout",                  500),
-    ("TransponderMainCycleMs",   "Transponder poll rate",                    2),
-    ("ChallengerMainCycleMs",    "Challenger poll rate",                  1000),
-    ("ResponseWaitCycleDelayMs", "Challenger wait per cycle for response",   10),
-    ("ResponseDelayToleranceMs", "Max acceptable challenge-response RTT",   500),
-    ("WatchdogTimeoutMs",        "Watchdog timeout",                       1000),
+CONFIG_FIELDS: List[Tuple[str, str, int, str]] = [
+    ("TxTimeoutMs",              "LoRa transmit timeout",                  500, "ms"),
+    ("TransponderMainCycleMs",   "Transponder poll rate",                    2, "ms"),
+    ("ChallengerMainCycleMs",    "Challenger poll rate",                  1000, "ms"),
+    ("ResponseWaitCycleDelayMs", "Challenger wait per cycle for response",   10, "ms"),
+    ("ResponseDelayToleranceMs", "Max acceptable challenge-response RTT",   500, "ms"),
+    ("WatchdogTimeoutMs",        "Watchdog timeout",                       1000, "ms"),
+    ("TxPowerDbm",               "LoRa TX output power (PA_BOOST pin)",      14, "dBm"),
+    ("LnaGain",                  "0=AGC auto  1=G1 max sens … 6=G6 min",      1,    ""),
 ]
 
 def _default_config() -> Dict[str, int]:
     return {f[0]: f[2] for f in CONFIG_FIELDS}
 
 def _pack_config(cfg: Dict[str, int]) -> bytes:
-    return struct.pack("<6I", *[cfg.get(f[0], f[2]) for f in CONFIG_FIELDS])
+    return struct.pack("<8I", *[cfg.get(f[0], f[2]) for f in CONFIG_FIELDS])
 
 def _unpack_config(data: bytes) -> Dict[str, int]:
-    return {f[0]: v for f, v in zip(CONFIG_FIELDS, struct.unpack("<6I", data))}
+    return {f[0]: v for f, v in zip(CONFIG_FIELDS, struct.unpack("<8I", data))}
 
 
 # ── ANSI colour helpers ───────────────────────────────────────────────────────
@@ -790,6 +793,29 @@ def _file_line(label: str, path: Path, expected_size: int) -> str:
     return f"  {icon}  {label:<16} {str(path):<36} [{detail}]"
 
 
+def _print_qr(data: str, label: str) -> None:
+    """Print a QR code for *data* in the terminal.
+    Requires:  pip3 install qrcode
+    """
+    try:
+        import qrcode  # type: ignore
+    except ImportError:
+        print(dim("  (install 'qrcode' for QR display:  pip3 install qrcode)"))
+        return
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=1,
+        border=2,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    buf = io.StringIO()
+    qr.print_ascii(out=buf, invert=True)
+    print(f"\n  {bold(label)}\n")
+    for line in buf.getvalue().splitlines():
+        print("  " + line)
+
+
 def _show_key_bytes(raw: bytes, expected_len: int) -> None:
     if expected_len == PRIVKEY_LEN:
         print(f"  Key  : {raw[:4].hex()} … {raw[-4:].hex()}"
@@ -981,9 +1007,10 @@ def menu_edit_config(settings: Settings) -> None:
         _clear()
         _header(settings, "Edit Configuration")
         cfg = settings["config"]
-        for i, (name, desc, default) in enumerate(CONFIG_FIELDS, 1):
+        for i, (name, desc, default, unit) in enumerate(CONFIG_FIELDS, 1):
             val = cfg.get(name, default)
-            print(f"  {i}.  {name:<32}  [{val:>6} ms]  {dim(desc)}")
+            val_str = f"{val}" + (f" {unit}" if unit else "")
+            print(f"  {i}.  {name:<32}  [{val_str:>10}]  {dim(desc)}")
         print(f"  {len(CONFIG_FIELDS) + 1}.  Reset to defaults")
         print(f"  0.  Back")
         print()
@@ -996,10 +1023,11 @@ def menu_edit_config(settings: Settings) -> None:
         if idx == 0:
             break
         elif 1 <= idx <= len(CONFIG_FIELDS):
-            name, _, default = CONFIG_FIELDS[idx - 1]
+            name, _, default, unit = CONFIG_FIELDS[idx - 1]
             current = cfg.get(name, default)
+            unit_str = f" {unit}" if unit else ""
             try:
-                v = input(f"  {name} [{current}]: ").strip()
+                v = input(f"  {name} [{current}{unit_str}]: ").strip()
             except (KeyboardInterrupt, EOFError):
                 continue
             if v:
@@ -1015,8 +1043,9 @@ def menu_edit_config(settings: Settings) -> None:
             _pause()
 
 def _print_config(cfg: Dict[str, int]) -> None:
-    for name, desc, default in CONFIG_FIELDS:
-        print(f"  {name:<32}  {cfg.get(name, default):>6} ms   {dim(desc)}")
+    for name, desc, default, unit in CONFIG_FIELDS:
+        val_str = f"{cfg.get(name, default):>6}" + (f" {unit}" if unit else "      ")
+        print(f"  {name:<32}  {val_str}   {dim(desc)}")
 
 
 
@@ -1049,6 +1078,10 @@ def menu_generate_keys(settings: Settings) -> None:
                 priv_bytes, pub_bytes = generate_keypair(out_dir)
                 print(green(f"  ✓  {priv_path}  [{len(priv_bytes)} B]"))
                 print(green(f"  ✓  {pub_path}   [{len(pub_bytes)} B]"))
+                _print_qr(priv_bytes.hex(),
+                           "Private key QR  (raw 32-byte scalar, hex)")
+                _print_qr("04" + pub_bytes.hex(),
+                           "Public key QR   (SEC uncompressed: 04||x||y)")
             except Exception as exc:
                 print(red(f"  ✗  Key generation failed: {exc}"))
                 _pause()
