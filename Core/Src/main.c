@@ -21,6 +21,9 @@
 #include "cmox_crypto.h"
 #include "keys.h"
 #include "uart_prov.h"
+#ifdef WATCHDOG_ENABLED
+  #include "stm32f1xx_hal_iwdg.h"
+#endif
 
 /* Private includes ----------------------------------------------------------*/
 #include "stdio.h"
