@@ -111,7 +111,7 @@ so up to four consecutive pings may be lost without dropping the session.
   |---------------|-------|-----------|---------|------|
   | `PROV_TYPE_PRIVKEY`  | `0xB1` | counterpart → device | SECP256R1 private key scalar | 32 B |
   | `PROV_TYPE_PUBKEY`   | `0xB2` | counterpart → device | SECP256R1 uncompressed public key x\|\|y | 64 B |
-  | `PROV_TYPE_CONFIG`   | `0xB3` | counterpart → device | Runtime config, 6 × `uint32_t` LE | 24 B |
+  | `PROV_TYPE_CONFIG`   | `0xB3` | counterpart → device | Runtime config, 8 × `uint32_t` LE | 32 B |
   | `PROV_GET_CONFIG`    | `0xB4` | counterpart → device | Query — no payload; device replies with `0xB3` | 0 B |
   | `PROV_GET_PRIVKEY`   | `0xB5` | counterpart → device | Query — no payload; device replies with `0xB1` | 0 B |
   | `PROV_GET_PUBKEY`    | `0xB6` | counterpart → device | Query — no payload; device replies with `0xB2` | 0 B |
@@ -126,7 +126,7 @@ Query packets (`0xB4–0xB6`) are answered with the corresponding data packet di
 
 #### Configuration payload layout
 
-All six fields are `uint32_t` in little-endian byte order (native STM32 storage format).
+All eight fields are `uint32_t` in little-endian byte order (native STM32 storage format).
 
 | Offset | Size | Field | Default |
 |--------|------|-------|---------|
@@ -136,8 +136,16 @@ All six fields are `uint32_t` in little-endian byte order (native STM32 storage 
 | 12 | 4 B | `ResponseWaitCycleDelayMs` — Challenger wait per cycle | 10 ms |
 | 16 | 4 B | `ResponseDelayToleranceMs` — Max acceptable challenge-response RTT | 500 ms |
 | 20 | 4 B | `WatchdogTimeoutMs` — IWDG reload timeout | 1000 ms |
+| 24 | 4 B | `TxPowerDbm` — LoRa TX output power via PA_BOOST pin (2–20 dBm) | 14 dBm |
+| 28 | 4 B | `LnaGain` — LNA gain: 0 = AGC auto, 1 = G1 (max sensitivity) … 6 = G6 (min sensitivity) | 1 |
 
-Total: 24 bytes.
+Total: 32 bytes.
+
+> **Field calibration note:** `LnaGain` is the primary range-tuning knob. Start at G1
+> (default, maximum sensitivity) and step towards G6 until reliable detection ends at the
+> desired boundary distance. `TxPowerDbm` controls how far the device is heard; reduce it
+> only if battery life is a concern after LNA is tuned. AGC (`LnaGain = 0`) can be used
+> when no fixed detection radius is required.
 
 #### Session flow
 
@@ -195,7 +203,7 @@ used directly of extended to receive the keys in the automatic way.
 |--------|-----------|-------------------|
 | Write private key  (`0xB1`) | 37 B | ≈ 38 ms |
 | Write public key   (`0xB2`) | 69 B | ≈ 72 ms |
-| Write configuration (`0xB3`) | 29 B | ≈ 30 ms |
+| Write configuration (`0xB3`) | 37 B | ≈ 38 ms |
 | Query (`0xB4`–`0xB6`)       |  5 B | < 1 ms |
 | PING / EOT / READY           |  1 B | < 1 ms |
 
@@ -208,9 +216,9 @@ The full page is erased and rewritten atomically when `EOT` is received.
 0x0800FC00  ┌──────────────────────┐   4 B   Magic pattern {0xF0, 0x0F, 0xDE, 0xAD}
 0x0800FC04  ├──────────────────────┤  32 B   Private key  (SECP256R1 scalar)
 0x0800FC24  ├──────────────────────┤  64 B   Public key   (SECP256R1 x‖y uncompressed)
-0x0800FC64  ├──────────────────────┤  24 B   Runtime configuration (6 × uint32_t LE)
-0x0800FC7C  ├──────────────────────┤
-            │   (unused — 900 B)   │
+0x0800FC64  ├──────────────────────┤  32 B   Runtime configuration (8 × uint32_t LE)
+0x0800FC84  ├──────────────────────┤
+            │   (unused — 892 B)   │
 0x0800FFFF  └──────────────────────┘
 ```
 

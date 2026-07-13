@@ -62,14 +62,39 @@ PROV_PING    = 0x05   # peer → device : keepalive (ignored by device packet lo
 PROV_SOF         = 0x55   # packet start-of-frame byte
 PKT_PRIVKEY      = 0xB1   # SECP256R1 private key scalar   (32 B)
 PKT_PUBKEY       = 0xB2   # SECP256R1 public key  x‖y     (64 B)
-PKT_CONFIG       = 0xB3   # runtime config  6 × uint32_t   (24 B)
+PKT_CONFIG       = 0xB3   # runtime config  8 × uint32_t   (32 B)
 PKT_GET_CONFIG   = 0xB4   # query: read back device config   (0 B payload)
 PKT_GET_PRIVKEY  = 0xB5   # query: read back stored privkey  (0 B payload)
 PKT_GET_PUBKEY   = 0xB6   # query: read back stored pubkey   (0 B payload)
+PKT_GET_DTC      = 0xB7   # query: read back DTC log         (0 B payload)
+PKT_CLR_DTC      = 0xB8   # command: clear DTC log           (0 B payload)
+PKT_TYPE_DTC     = 0xB9   # response: count(1B) + entries(N × 8B)
 
-PRIVKEY_LEN = 32
-PUBKEY_LEN  = 64
-CONFIG_LEN  = 32    # 8 × uint32_t
+PRIVKEY_LEN    = 32
+PUBKEY_LEN     = 64
+CONFIG_LEN     = 32    # 8 × uint32_t
+DTC_ENTRY_SIZE = 8     # id(1) + cnd1(1) + cnd2(1) + pad(1) + timestamp_s(4)
+DTC_MAX_ENTRIES = 30
+
+DTC_NAMES: Dict[int, str] = {
+    0x01: "Reset",
+    0x02: "SW failure",
+    0x03: "HW failure",
+    0x04: "LoRa Rx timeout",
+    0x05: "LoRa CRC error",
+    0x06: "HMAC failure",
+    0x07: "LoRa Tx timeout",
+    0x08: "LoRa init failure",
+    0x09: "Challenge RTT exceeded",
+}
+
+DTC_RST_CAUSES: Dict[int, str] = {
+    0x01: "power-on",
+    0x02: "watchdog",
+    0x03: "software",
+    0x04: "pin reset",
+    0x05: "brownout",
+}
 
 
 # ── Config field definitions (order matches NVRAM layout) ────────────────────
@@ -507,8 +532,8 @@ class ProvSession:
                 return None
             frame.append(b)
         pkt_len = frame[2]
-        if pkt_len > 64:            # sanity: largest known payload is 64 B (pubkey)
-            self._log(red(f"LEN={pkt_len} > 64 — framing error, aborting"))
+        if pkt_len > 255:           # sanity: LEN field is 1 byte, 255 is the absolute max
+            self._log(red(f"LEN={pkt_len} > 255 — framing error, aborting"))
             return None
         for _ in range(pkt_len):    # PAYLOAD
             b = self._recv(self.byte_timeout)
@@ -627,6 +652,98 @@ class ProvSession:
                       f"{self.max_retries} attempts."))
         return None
 
+    def get_dtc(self) -> Optional[List[Dict[str, int]]]:
+        """Send GET_DTC request; return list of parsed DTC entries or None on error."""
+        packet = build_packet(PKT_GET_DTC, b"")
+        print(f"\n  {bold('▸  GET_DTC request')}")
+        if self.verbose:
+            _hex_dump("Packet", packet)
+
+        for attempt in range(1, self.max_retries + 1):
+            if attempt > 1:
+                self._log(yellow(f"Retry {attempt}/{self.max_retries}…"))
+
+            self._conn.send(packet, flush_rx=True)
+
+            resp = None
+            for _ in range(4):
+                resp = self._recv(timeout=self.byte_timeout)
+                if resp is None:
+                    self._log(yellow(f"No response (attempt {attempt})"))
+                    break
+                if resp in (PROV_RJCT, PROV_NAK):
+                    print(f"\n  {red('✗')}  Device doesn't support DTC read-out.")
+                    return None
+                if resp == PROV_SOF:
+                    break
+                self._log(yellow(f"Skipping stale byte 0x{resp:02X}"))
+
+            if resp != PROV_SOF:
+                continue
+
+            result = self._recv_packet_from_sof()
+            if result is None:
+                self._log(yellow(f"Incomplete response (attempt {attempt})"))
+                continue
+            pkt_type, payload = result
+            if pkt_type != PKT_TYPE_DTC or len(payload) < 1:
+                self._log(yellow(
+                    f"Unexpected response type=0x{pkt_type:02X} len={len(payload)}"
+                    f" (attempt {attempt})"))
+                continue
+
+            count = payload[0]
+            fw_major, fw_minor, fw_patch = payload[1], payload[2], payload[3]
+            fw_version = f"{fw_major}.{fw_minor}.{fw_patch}"
+            expected_len = 5 + count * DTC_ENTRY_SIZE
+            if len(payload) < expected_len:
+                self._log(yellow(
+                    f"Short payload: got {len(payload)}, expected {expected_len}"))
+                continue
+
+            entries = []
+            for i in range(count):
+                off = 5 + i * DTC_ENTRY_SIZE
+                e_id, ev1, ev2, _pad, ts = struct.unpack_from('<BBBBI', payload, off)
+                entries.append({"id": e_id, "ev1": ev1, "ev2": ev2,
+                                 "timestamp_s": ts})
+
+            n = count
+            self._log(green(
+                f"DTC log received  ✓  ({n} entr{'y' if n == 1 else 'ies'})  fw v{fw_version}"))
+            return {"fw_version": fw_version, "entries": entries}
+
+        self._log(red(f"GET_DTC failed after {self.max_retries} attempts."))
+        return None
+
+    def clr_dtc(self) -> bool:
+        """Send CLR_DTC command; return True on ACK."""
+        packet = build_packet(PKT_CLR_DTC, b"")
+        print(f"\n  {bold('▸  CLR_DTC command')}")
+        if self.verbose:
+            _hex_dump("Packet", packet)
+
+        for attempt in range(1, self.max_retries + 1):
+            if attempt > 1:
+                self._log(yellow(f"Retry {attempt}/{self.max_retries}…"))
+
+            self._conn.send(packet, flush_rx=True)
+
+            resp = self._recv(timeout=self.byte_timeout)
+            if resp is None:
+                self._log(yellow(f"No response (attempt {attempt})"))
+                continue
+            if resp == PROV_ACK:
+                self._log(green("DTC log cleared  ✓"))
+                return True
+            if resp == PROV_RJCT:
+                print(f"\n  {red('✗')}  Device doesn't support CLR_DTC.")
+                return False
+            self._log(yellow(f"Unexpected response 0x{resp:02X} (attempt {attempt})"))
+
+        self._log(red(f"CLR_DTC failed after {self.max_retries} attempts."))
+        return False
+
     # ── Summary ───────────────────────────────────────────────────────────────
 
     def print_summary(self, success: bool) -> None:
@@ -729,6 +846,16 @@ def do_get_key(query_type: int, resp_type: int,
         return None
     return _gs.prov.get_key(query_type, resp_type, expected_len, label)
 
+def do_get_dtc(settings: Settings) -> Optional[Dict]:
+    if not ensure_connected(settings):
+        return None
+    return _gs.prov.get_dtc()
+
+def do_clr_dtc(settings: Settings) -> bool:
+    if not ensure_connected(settings):
+        return False
+    return _gs.prov.clr_dtc()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TUI helpers
@@ -829,6 +956,89 @@ def _show_key_bytes(raw: bytes, expected_len: int) -> None:
 #  TUI menus
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _format_dtc_time(ts: int) -> str:
+    h = ts // 3600
+    m = (ts % 3600) // 60
+    s = ts % 60
+    return f"{h}:{m:02d}:{s:02d}"
+
+def _dtc_entry_detail(eid: int, ev1: int, ev2: int) -> str:
+    if eid == 0x01:                             # Reset — ev1 is reset cause
+        return DTC_RST_CAUSES.get(ev1, f"0x{ev1:02X}")
+    if eid == 0x09:                             # RTT exceeded — ev1:ev2 big-endian ms
+        return f"RTT={(ev1 << 8) | ev2} ms"
+    return f"ev={ev1:02X}/{ev2:02X}" if (ev1 or ev2) else ""
+
+def _dtc_detail(entry: Dict[str, int]) -> str:
+    eid  = entry["id"]
+    name = DTC_NAMES.get(eid, f"Unknown (0x{eid:02X})")
+    ts   = _format_dtc_time(entry["timestamp_s"])
+    det  = _dtc_entry_detail(eid, entry["ev1"], entry["ev2"])
+    return f"[{ts}]  0x{eid:02X}  {name:<26} {det}"
+
+def _save_dtc_json(entries: List[Dict[str, int]], fw_version: str,
+                   settings: Settings) -> Path:
+    """Persist DTC read-out to dtc_YYYYMMDD-HHMMSS.json; return the path written."""
+    records = []
+    for e in entries:
+        eid, ev1, ev2 = e["id"], e["ev1"], e["ev2"]
+        records.append({
+            "id":          eid,
+            "name":        DTC_NAMES.get(eid, f"Unknown (0x{eid:02X})"),
+            "ev1":         ev1,
+            "ev2":         ev2,
+            "timestamp_s": e["timestamp_s"],
+            "uptime":      _format_dtc_time(e["timestamp_s"]),
+            "detail":      _dtc_entry_detail(eid, ev1, ev2),
+        })
+    payload = {
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "fw_version":  fw_version,
+        "port":        settings["port"],
+        "entry_count": len(entries),
+        "entries":     records,
+    }
+    out = Path(f"dtc_{time.strftime('%Y%m%d-%H%M%S')}.json")
+    out.write_text(json.dumps(payload, indent=2))
+    return out
+
+
+def menu_diagnostics(settings: Settings) -> None:
+    while True:
+        _clear()
+        _header(settings, "Diagnostics")
+        choice = _choose(["Read DTCs", "Clear DTCs"])
+        if choice == 0:
+            break
+        elif choice == 1:
+            result = do_get_dtc(settings)
+            if result is None:
+                _pause()
+            else:
+                entries    = result["entries"]
+                fw_version = result["fw_version"]
+                if not entries:
+                    print(f"\n  {green('✓')}  No DTCs stored.  "
+                          f"{dim(f'fw v{fw_version}')}")
+                else:
+                    print(f"\n  {bold(f'{len(entries)} DTC(s) stored')}  "
+                          f"{dim(f'fw v{fw_version}')}\n")
+                    print(f"  {'Uptime':<10}  {'ID':<4}  {'Name':<26}  Detail")
+                    print("  " + "─" * 62)
+                    for e in entries:
+                        print(f"  {_dtc_detail(e)}")
+                try:
+                    saved = _save_dtc_json(entries, fw_version, settings)
+                    print(f"\n  {green('✓')}  Saved → {saved}")
+                except OSError as exc:
+                    print(f"\n  {yellow('!')}  Could not save file: {exc}")
+                _pause()
+        elif choice == 2:
+            if _ask_yn("Clear all DTCs on device?"):
+                do_clr_dtc(settings)
+                _pause()
+
+
 def menu_main(settings: Settings) -> None:
     start_auto_connect(settings)   # begin listening for device READY immediately
     while True:
@@ -840,6 +1050,7 @@ def menu_main(settings: Settings) -> None:
             "Public Key",
             "Configuration",
             "Generate Key Pair",
+            "Diagnostics",
             "Settings",
             "Disconnect" if _gs.conn else dim("Disconnect  (not connected)"),
         ], zero_label="Exit")
@@ -864,8 +1075,10 @@ def menu_main(settings: Settings) -> None:
         elif choice == 5:
             menu_generate_keys(settings)
         elif choice == 6:
-            menu_settings(settings)
+            menu_diagnostics(settings)
         elif choice == 7:
+            menu_settings(settings)
+        elif choice == 8:
             if _gs.conn:
                 if _ask_yn("Write flash before disconnect?"):
                     disconnect(commit=True)
@@ -882,7 +1095,7 @@ def menu_flash_all(settings: Settings) -> None:
         _header(settings, "Flash All")
         print(_file_line("Private key", settings.privkey_path(),  PRIVKEY_LEN))
         print(_file_line("Public key",  settings.pubkey_path(),   PUBKEY_LEN))
-        print(f"  {green('✓')}  {'Config':<16} (from settings)  [6 fields]")
+        print(f"  {green('✓')}  {'Config':<16} (from settings)  [8 fields]")
         print()
         choice = _choose(["Start", "Edit config values"])
         if choice == 0:

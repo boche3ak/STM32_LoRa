@@ -21,6 +21,7 @@
 #include "cmox_crypto.h"
 #include "keys.h"
 #include "uart_prov.h"
+#include "dtc.h"
 #ifdef WATCHDOG_ENABLED
   #include "stm32f1xx_hal_iwdg.h"
 #endif
@@ -796,11 +797,17 @@ static void ChallengerLoop(void) {
           PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
         } else {
           PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* bad HMAC, counter mismatch, or delay exceeded */
+          if(roundTripMs > Cfg_ResponseDelayToleranceMs){
+            dtc_log(DTC_CHALLENGE_RTT_EXCEEDED,
+                    (uint8_t)(roundTripMs >> 8u),
+                    (uint8_t)(roundTripMs & 0xFFu));
+          }
         }
       }
     }
     UpdateModemStatusDebug();
     UpdateIrqFlagsDebug();
+    dtc_tick();
     ChallengerCyclePause();
   }//while stay active ** Challenger main loop **
 }
@@ -851,6 +858,7 @@ static void TransponderLoop(void) {
     }
     UpdateModemStatusDebug();
     UpdateIrqFlagsDebug();
+    dtc_tick();
     HAL_Delay(WATCHDOG_SAFE_POLL_MS(Cfg_TransponderMainCycleMs));
     PIN_WRITE_STAT_POWERON(ledState^=1u); /* toggle LED to indicate the transponder is alive */
     WATCHDOG_REFRESH();
@@ -889,6 +897,10 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI1_Init(); //SPI1 is used for LoRa module
 
+  /* DTC init: read RCC_CSR reset cause, load prior DTCs from flash, log DTC_RESET.
+   * Must run before uart_prov_run() so the provisioning session can read/clear DTCs. */
+  dtc_init();
+
   /* Field provisioning via UART (PA9/PA10, 9600 8N1).
    * Runs only when a provisioning counterpart is present on startup.
    * Keys and config are written to NVRAM; the call is a no-op if no
@@ -925,6 +937,8 @@ int main(void)
   int returnCode = LoRa_init(&loRa);
 
   if(returnCode != 200) {
+    dtc_log(DTC_LORA_INIT_FAILURE, (uint8_t)returnCode, 0u);
+    dtc_flush();
     FaultBlinkHalt();
   }
 
