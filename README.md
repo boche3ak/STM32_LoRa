@@ -1,3 +1,12 @@
+## Getting Started
+
+A mininum setup to build the software includes
+1. cmake tools
+2. ninja build engine
+3. arm-none-eabi-gcc compiler (at least GCC11)
+
+Install, update PATH variable, build.
+
 ## Document References
 
 [STM32F103 Datasheet](https://www.st.com/resource/en/datasheet/stm32f103c8.pdf)
