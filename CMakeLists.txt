@@ -30,6 +30,14 @@ target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 $<$<CONFIG:Release>:WATCHDOG_ENABLED>
 )
+
+# HAL_IWDG_MODULE_ENABLED is defined here instead of stm32f1xx_hal_conf.h
+# (which CubeMX regenerates) so it stays in lockstep with WATCHDOG_ENABLED.
+# Directory scope is required: stm32f1xx_hal_iwdg.c is compiled by the
+# STM32_Drivers target in cmake/stm32cubemx, and its whole body is guarded
+# by #ifdef HAL_IWDG_MODULE_ENABLED.
+add_compile_definitions($<$<CONFIG:Release>:HAL_IWDG_MODULE_ENABLED>)
+
 message("===================================================")
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     message("This is a release version with following setup:")
