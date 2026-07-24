@@ -135,7 +135,7 @@ Query packets (`0xB4–0xB6`) are answered with the corresponding data packet di
 
 #### Configuration payload layout
 
-All six fields are `uint32_t` in little-endian byte order (native STM32 storage format).
+All eight fields are `uint32_t` in little-endian byte order (native STM32 storage format).
 
 | Offset | Size | Field | Default |
 |--------|------|-------|---------|
@@ -145,6 +145,9 @@ All six fields are `uint32_t` in little-endian byte order (native STM32 storage 
 | 12 | 4 B | `ResponseWaitCycleDelayMs` — Challenger wait per cycle | 10 ms |
 | 16 | 4 B | `ResponseDelayToleranceMs` — Max acceptable challenge-response RTT | 500 ms |
 | 20 | 4 B | `WatchdogTimeoutMs` — IWDG reload timeout | 1000 ms |
+| 24 | 4 B | `TxPowerDbm` — LoRa Tx output power (PA_BOOST pin) | 14 dBm |
+| 28 | 4 B | `LnaGain` — LoRa Rx input sensitivity (0=AGC auto, 1=G1 max sens, ... 6=G6 min) | 1 |
+
 
 Total: 24 bytes.
 
