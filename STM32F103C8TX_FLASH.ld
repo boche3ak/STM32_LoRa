@@ -45,7 +45,8 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 20K
-  FLASH    (rx)   : ORIGIN = 0x08000000,   LENGTH = 63K   /* 63K for code; last 1K page reserved for NVRAM */
+  FLASH    (rx)   : ORIGIN = 0x08000000,   LENGTH = 62K   /* 62K for code; last two 1K pages reserved */
+  DTC      (r)    : ORIGIN = 0x0800F800,   LENGTH = 1K    /* one erase page: diagnostic trouble codes */
   NVRAM    (r)    : ORIGIN = 0x0800FC00,   LENGTH = 1K    /* one erase page: magic pattern + keys */
 }
 
@@ -196,6 +197,19 @@ SECTIONS
    * value changes.
    *
    * ------------------------------------------------------------------------- */
+  /* -------------------------------------------------------------------------
+   * DTC region  (0x0800F800 – 0x0800FBFF, one 1 KB erase page)
+   *
+   * Written entirely at runtime by dtc.c; no linker-placed symbols here.
+   * The section exists only to prevent the linker from placing code or
+   * read-only data into this page.
+   * ------------------------------------------------------------------------- */
+  .fof_dtc (NOLOAD) :
+  {
+    . = ALIGN(1024);
+    . = . + 1024;
+  } >DTC
+
   .fof_magic :
   {
     KEEP(*(.fof_magic))

@@ -63,6 +63,11 @@ add_subdirectory(cmake/stm32cubemx)
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/LoRa/LoRa.c
 )
+
+# DTC framework
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+    ${CMAKE_SOURCE_DIR}/Core/Src/dtc.c
+)
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/LoRa
 )

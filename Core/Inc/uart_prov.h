@@ -110,11 +110,15 @@ extern "C" {
 #define PROV_GET_CONFIG     0xB4u
 #define PROV_GET_PRIVKEY    0xB5u
 #define PROV_GET_PUBKEY     0xB6u
+#define PROV_GET_DTC        0xB7u  /* query: device replies with PROV_TYPE_DTC  */
+#define PROV_CLR_DTC        0xB8u  /* command: clear DTC log, device replies ACK */
+#define PROV_TYPE_DTC       0xB9u  /* response: count(1B) + entries(count × 8B) */
 
 /* Payload lengths (bytes) */
 #define PROV_PRIVKEY_LEN    32u
 #define PROV_PUBKEY_LEN     64u
 #define PROV_CONFIG_LEN     32u   /* 8 × uint32_t */
+/* DTC response: 5 (count + MAJOR + MINOR + PATCH + rsvd) + 30 × 8 = 245 B max — fits in one-byte LEN */
 
 typedef enum {
     UART_PROV_NO_COUNTERPART = 0, /* no counterpart detected — normal cold start */

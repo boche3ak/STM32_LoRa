@@ -13,6 +13,8 @@
   */
 
 #include "uart_prov.h"
+#include "dtc.h"
+#include "version.h"
 #include "usart.h"
 #include "main.h"
 #include <string.h>
@@ -194,6 +196,8 @@ static bool recv_packet_body(Packet *pkt, uint8_t frame_buf[/* 3+64 */])
         case PROV_GET_CONFIG:    expected_len = 0u;               break;
         case PROV_GET_PRIVKEY:   expected_len = 0u;               break;
         case PROV_GET_PUBKEY:    expected_len = 0u;               break;
+        case PROV_GET_DTC:       expected_len = 0u;               break;
+        case PROV_CLR_DTC:       expected_len = 0u;               break;
         default:
             /* Unknown type: drain payload + CRC to keep framing intact, then reject. */
             for (uint8_t i = 0u; i < len; i++) {
@@ -352,7 +356,30 @@ UartProvResult uart_prov_run(void)
         bool pkt_ok = recv_packet_body(&pkt, frame_buf);
 
         if (pkt_ok) {
-            if (   pkt.type == PROV_GET_CONFIG
+            if (pkt.type == PROV_GET_DTC) {
+                /* Send DTC log: SOF | PROV_TYPE_DTC | LEN | count | MAJOR | MINOR | PATCH | 0 | entries | CRC */
+                uint8_t  cnt     = dtc_get_count();
+                uint8_t  pay_len = (uint8_t)(5u + (uint32_t)cnt * DTC_ENTRY_SIZE);
+                /* 3 frame bytes + 5 version/count header + 240 max entries */
+                uint8_t  resp[3u + 5u + DTC_MAX_ENTRIES * DTC_ENTRY_SIZE];
+                resp[0u] = PROV_SOF;
+                resp[1u] = PROV_TYPE_DTC;
+                resp[2u] = pay_len;
+                resp[3u] = cnt;
+                resp[4u] = FW_VERSION_MAJOR;
+                resp[5u] = FW_VERSION_MINOR;
+                resp[6u] = FW_VERSION_PATCH;
+                resp[7u] = 0u;   /* reserved */
+                memcpy(&resp[8u], dtc_get_entries(), (uint32_t)cnt * DTC_ENTRY_SIZE);
+                uint16_t crc = crc16_ccitt(resp, (uint16_t)(3u + pay_len));
+                for (uint16_t i = 0u; i < (uint16_t)(3u + pay_len); i++)
+                    uart_send(resp[i]);
+                uart_send((uint8_t)(crc >> 8u));
+                uart_send((uint8_t)(crc & 0xFFu));
+            } else if (pkt.type == PROV_CLR_DTC) {
+                dtc_clear();
+                uart_send(PROV_ACK);
+            } else if (   pkt.type == PROV_GET_CONFIG
                 || pkt.type == PROV_GET_PRIVKEY
                 || pkt.type == PROV_GET_PUBKEY) {
                 /*
@@ -423,16 +450,20 @@ UartProvResult uart_prov_run(void)
     if (session_err) {
         result = UART_PROV_ERROR;
         led_show_for(LED_SOS, ERROR_SHOW_MS);
-    } else if (!any_stored) {
-        result = UART_PROV_OK;        /* counterpart had nothing to send */
-        led_show_for(LED_STEADY_ON, SUCCESS_SHOW_MS);
     } else {
-        if (nvram_write_page()) {
-            result = UART_PROV_OK;
+        /* Clean session end (EOT received): persist DTCs before NVRAM write */
+        dtc_flush();
+        if (!any_stored) {
+            result = UART_PROV_OK;        /* counterpart had nothing to send */
             led_show_for(LED_STEADY_ON, SUCCESS_SHOW_MS);
         } else {
-            result = UART_PROV_ERROR;
-            led_show_for(LED_SOS, ERROR_SHOW_MS);
+            if (nvram_write_page()) {
+                result = UART_PROV_OK;
+                led_show_for(LED_STEADY_ON, SUCCESS_SHOW_MS);
+            } else {
+                result = UART_PROV_ERROR;
+                led_show_for(LED_SOS, ERROR_SHOW_MS);
+            }
         }
     }
 
