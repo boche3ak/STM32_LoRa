@@ -79,7 +79,7 @@
   *   (SESSION_IDLE_TIMEOUT_MS = 5000 ms >> 1 s ping interval).  Flash is
   *   written atomically only when PROV_EOT is received.
   *
-  * LED feedback (PA2 — STAT_FRIEND_FOF):
+  * LED feedback (power-on LED, PA3 — STAT_POWERON):
   *   Searching for counterpart : 250 ms on / 250 ms off  (slow blink)
   *   Communication in progress : 50 ms on  / 50 ms off   (fast blink)
   *   Provisioning complete     : constant ON

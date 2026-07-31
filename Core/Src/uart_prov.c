@@ -15,6 +15,7 @@
 #include "uart_prov.h"
 #include "usart.h"
 #include "main.h"
+#include "board.h"
 #include <string.h>
 #include <stdbool.h>
 
@@ -38,10 +39,10 @@
 #define ERROR_SHOW_MS      10000u /* SOS LED duration after error         */
 
 /* ============================================================================
- * LED  (PA2 — STAT_FRIEND_FOF)
+ * LED  (power-on LED, see board.h)
  * ============================================================================ */
-#define PROV_LED_ON()   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_SET)
-#define PROV_LED_OFF()  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_RESET)
+#define PROV_LED_ON()   PIN_WRITE_STAT_POWERON(GPIO_PIN_SET)
+#define PROV_LED_OFF()  PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET)
 
 /* SOS Morse: interleaved (ON ms, OFF ms) pairs */
 static const uint16_t sos_pattern[] = {
