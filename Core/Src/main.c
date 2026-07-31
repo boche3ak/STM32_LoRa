@@ -61,15 +61,12 @@ enum {
 /* Private macro -------------------------------------------------------------*/
 
 /* pin definitions according to the current schematics*/
-#define PIN_READ_WHOAMI                  HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8)           /* PA8 */
-#define PIN_WRITE_STAT_FRIEND_FOF(state) HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, (state)) /* PA2 */
-#ifdef WATCHDOG_ENABLED
-  #define PIN_WRITE_STAT_POWERON(state)    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, (state)) /* PA3 */
-#else
-  #define PIN_WRITE_STAT_POWERON(state)    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, (state)) /* PC13 - using available LED for debug purposes */
-#endif
-#define STAT_FRIEND                     GPIO_PIN_SET
-#define STAT_FOE                        GPIO_PIN_RESET
+#define PIN_READ_WHOAMI                  HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8)           /* PA8 physical switch to select Challenger or Receiver*/
+#define PIN_WRITE_STAT_FRIEND_FOF(state) HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, (state)) /* PA2 external LED, FRIEND/FOE indication, e.g. in front of the POV cam*/
+#define PIN_WRITE_STAT_POWERON(state)    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, (state)) /* PA3 external LED, POWERON indication*/
+#define PIN_WRITE_STAT_HEARTBEAT(state)  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, (state))/* PC13 - standard bluepill available LED ->only for debug purposes */
+#define STAT_FRIEND                      GPIO_PIN_SET
+#define STAT_FOE                         GPIO_PIN_RESET
 
 
 /* ---------------------------------------------------------------------------
@@ -601,7 +598,7 @@ static void ChallengerTestLoop(void) {
 
 
     // # 3 Transmit the challenge and start rx listening
-    PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);// toggle TX (on)
+    PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);// toggle TX (on)
     LoRa_transmit(&loRa, TxBuffer, TEST_PING_LEN, Cfg_TxTimeoutMs);
     Dbg_PingTxCount++;
 
@@ -615,15 +612,15 @@ static void ChallengerTestLoop(void) {
       WATCHDOG_REFRESH();
     }
 
-    PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);// Toggle TX (off)
+    PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_SET);// Toggle TX (off)
     if(!loRaRxReady){
-      PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);/* timeout — no reply or foe */
+      PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);/* timeout — no reply or foe */
       HAL_Delay(50u);
-      PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+      PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_SET);
       HAL_Delay(50u);
-      PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+      PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);
       HAL_Delay(50u);
-      PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+      PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_SET);
       HAL_Delay(50u);
     } else {
       LoRa_receive(&loRa, RxBuffer, TXRX_BUFFER_MAX_LENGTH);
@@ -637,11 +634,11 @@ static void ChallengerTestLoop(void) {
       }
       if(match == 1u)
       {
-        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);// indicate RX
+        PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);// indicate RX
         HAL_Delay(100u);
-        PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);// indicate RX
+        PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_SET);// indicate RX
         HAL_Delay(100u);
-        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);// indicate RX
+        PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);// indicate RX
       }
       Dbg_PingRxMatch = match;
     }
@@ -660,7 +657,7 @@ static void ChallengerTestLoop(void) {
  *          with a triple negative LED flash before returning to listen mode.
  */
 static void TransponderTestLoop(void) {
-  PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+  PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);
   LoRa_startReceiving(&loRa);
   uint8_t ledState = GPIO_PIN_RESET;
   while(stayActive){
@@ -687,9 +684,9 @@ static void TransponderTestLoop(void) {
        * sent back. The LED is normally lit while receiving (PC13: RESET = on),
        * so each flash is a short dark pulse: SET = off, RESET = back on. */
       for(uint8_t i = 0u; i < 3u; i++){
-        PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);   /* dark pulse */
+        PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_SET);   /* dark pulse */
         HAL_Delay(50u);
-        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET); /* back to lit */
+        PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET); /* back to lit */
         HAL_Delay(50u);
         WATCHDOG_REFRESH();
       }
@@ -698,7 +695,7 @@ static void TransponderTestLoop(void) {
     UpdateModemStatusDebug();
     UpdateIrqFlagsDebug();
     HAL_Delay(WATCHDOG_SAFE_POLL_MS(Cfg_TransponderMainCycleMs));
-    PIN_WRITE_STAT_POWERON(ledState^=1u); /* toggle LED to indicate the transponder is alive */
+    PIN_WRITE_STAT_HEARTBEAT(ledState^=1u); /* toggle LED to indicate the transponder is alive */
     WATCHDOG_REFRESH();
   }//while stay active ** Transponder test ping loop **
 }
@@ -751,7 +748,7 @@ static void ChallengerLoop(void) {
 
 
       // # 3 Transmit the challenge and start rx listening
-      PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);// toggle TX (on)
+      PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);// toggle TX (on)
       LoRa_transmit(&loRa, TxBuffer, CHALLENGE_PACKET_LEN, Cfg_TxTimeoutMs);
 
       loRaRxReady = 0u;
@@ -764,17 +761,17 @@ static void ChallengerLoop(void) {
         WATCHDOG_REFRESH();
       }
 
-      PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);// Toggle TX (off)
+      PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_SET);// Toggle TX (off)
       if(!loRaRxReady){
         PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* timeout — no reply or foe */
         /* LED indication: double blink on timeout (test-style, to be replaced) */
-        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+        PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);
         HAL_Delay(50u);
-        PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+        PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_SET);
         HAL_Delay(50u);
-        PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+        PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);
         HAL_Delay(50u);
-        PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+        PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_SET);
         HAL_Delay(50u);
       } else {
         uint32_t roundTripMs   = HAL_GetTick() - txTimestamp;
@@ -789,11 +786,11 @@ static void ChallengerLoop(void) {
            && roundTripMs <= Cfg_ResponseDelayToleranceMs){
           PIN_WRITE_STAT_FRIEND_FOF(STAT_FRIEND);
           /* LED indication: friend confirmed (test-style, to be replaced) */
-          PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+          PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);
           HAL_Delay(100u);
-          PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
+          PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_SET);
           HAL_Delay(100u);
-          PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET);
+          PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET);
         } else {
           PIN_WRITE_STAT_FRIEND_FOF(STAT_FOE); /* bad HMAC, counter mismatch, or delay exceeded */
         }
@@ -816,7 +813,7 @@ static void ChallengerLoop(void) {
 static void TransponderLoop(void) {
   ComputeSharedSecret();
 
-  PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET); /* LED on: listening */
+  PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET); /* LED on: listening */
   LoRa_startReceiving(&loRa); /* silent listen; reception is IRQ-driven */
   uint8_t ledState = GPIO_PIN_RESET;
 
@@ -840,9 +837,9 @@ static void TransponderLoop(void) {
           /* LED indication: negative-flash 3x after a valid challenge was
            * answered (test-style, to be replaced) */
           for(uint8_t i = 0u; i < 3u; i++){
-            PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);   /* dark pulse */
+            PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_SET);   /* dark pulse */
             HAL_Delay(50u);
-            PIN_WRITE_STAT_POWERON(GPIO_PIN_RESET); /* back to lit */
+            PIN_WRITE_STAT_HEARTBEAT(GPIO_PIN_RESET); /* back to lit */
             HAL_Delay(50u);
             WATCHDOG_REFRESH();
           }
@@ -852,7 +849,7 @@ static void TransponderLoop(void) {
     UpdateModemStatusDebug();
     UpdateIrqFlagsDebug();
     HAL_Delay(WATCHDOG_SAFE_POLL_MS(Cfg_TransponderMainCycleMs));
-    PIN_WRITE_STAT_POWERON(ledState^=1u); /* toggle LED to indicate the transponder is alive */
+    PIN_WRITE_STAT_HEARTBEAT(ledState^=1u); /* toggle LED to indicate the transponder is alive */
     WATCHDOG_REFRESH();
   }//while stay active ** Transponder main loop **
 }
@@ -894,6 +891,9 @@ int main(void)
    * Keys and config are written to NVRAM; the call is a no-op if no
    * counterpart is detected within the detection window. */
   uart_prov_run();
+
+  /* Indicating power on state*/
+  PIN_WRITE_STAT_POWERON(GPIO_PIN_SET);
 
 #ifdef WATCHDOG_ENABLED
   hiwdg.Instance       = IWDG;
