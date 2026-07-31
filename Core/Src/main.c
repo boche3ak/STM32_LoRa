@@ -16,6 +16,7 @@
   */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "board.h"
 #include "spi.h"
 #include "gpio.h"
 #include "cmox_crypto.h"
@@ -60,13 +61,7 @@ enum {
 
 /* Private macro -------------------------------------------------------------*/
 
-/* pin definitions according to the current schematics*/
-#define PIN_READ_WHOAMI                  HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8)           /* PA8 physical switch to select Challenger or Receiver*/
-#define PIN_WRITE_STAT_FRIEND_FOF(state) HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, (state)) /* PA2 external LED, FRIEND/FOE indication, e.g. in front of the POV cam*/
-#define PIN_WRITE_STAT_POWERON(state)    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, (state)) /* PA3 external LED, POWER-ON indication*/
-#define PIN_WRITE_STAT_HEARTBEAT(state)  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, (state))/* PC13 - standard bluepill available LED ->only for debug purposes */
-#define STAT_FRIEND                      GPIO_PIN_SET
-#define STAT_FOE                         GPIO_PIN_RESET
+/* Pin map and status-LED action macros: see board.h */
 
 
 /* ---------------------------------------------------------------------------

@@ -45,8 +45,8 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     else()
     message("This is a debug version with following limitations:")
     message("WATCHDOG: DISABLED")
-    message("POWER LED is PC13 (standard blue pill)")
     endif()
+message("POWER-ON LED: PA3 (external) | HEARTBEAT LED: PC13 (on-board blue pill)")
 message("===================================================")
 
 # ---------------------------------------------------------------------------
