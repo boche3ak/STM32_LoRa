@@ -53,6 +53,7 @@ void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(NSS_GPIO_Port, NSS_Pin, GPIO_PIN_SET);
@@ -69,8 +70,8 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(DIO0_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PA2 NSS_Pin */
-  GPIO_InitStruct.Pin = GPIO_PIN_2|NSS_Pin;
+  /*Configure GPIO pins : PA2, PA3 and NSS_Pin */
+  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_3|NSS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -90,7 +91,6 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-#ifndef WATCHDOG_ENABLED
   __HAL_RCC_GPIOC_CLK_ENABLE();
     /*Configure GPIO pin : PC13/USER LED */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
@@ -99,7 +99,6 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-#endif
 
   /*Configure GPIO pin : PA8 (Challenger/Transponder) */
   GPIO_InitStruct.Pin = GPIO_PIN_8;
